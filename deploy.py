@@ -48,7 +48,7 @@ def sync_file(path, bucket, start_path, check_remote=True):
             else:
                 raise Exception( "MD5 mismatch... %s :: %s" % (local_hash, remote_hash) )
     logger.debug("UPLOADING " + path)
-    gsutil('cp', path, "gs://"+bucket+"/"+relpath)
+    gsutil('-m', 'cp', path, "gs://"+bucket+"/"+relpath)
     logger.debug("UPLOADED " +path)
 
 def sync_recursive(source_dir, dest_bucket):
