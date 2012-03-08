@@ -100,7 +100,9 @@ def db_reporter(q, finished, dbname):
 def sync_parallel(filename_iterator, options):
     response = None
     while response not in ('y','n'):
-        response = raw_input("Do you want to run a remote inventory first?  You probably do. (y/n)")
+        response = raw_input("Do you want to run a remote inventory first?  You probably do, but it will take a while. (y/n)")
+    if response =='y':
+        remote_inventory(options.source_dir, options.dest_bucket)
 
     task_q = multiprocessing.JoinableQueue(options.max_queue_size)
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
@@ -125,7 +127,7 @@ def names_from_db(dbname, which="untransfered", dblock=None):
     if which != "all":
         qry += " WHERE remote_exists IS NULL"
     qry += " LIMIT %d" % options.db_chunk_size
-    print qry
+    logger.debug( qry )
     while True:
         cursor = connection.cursor()
         if dblock: dblock.acquire()
@@ -160,6 +162,12 @@ def ensure_exists(path):
         pass
 
 def local_inventory(source_dir, bucketname):
+    if os.path.exists(options.inventory_db):
+        response = None   
+        while response not in ('y','n'):
+            response = raw_input("Database exists at %s.  Clobber it? (y/n)" % options.inventory_db)
+        if response == 'n':
+            return False
     inventory_path = options.inventory_path
     ensure_exists(inventory_path)
     conn = sqlite3.connect(options.inventory_db)
@@ -269,4 +277,4 @@ if __name__ == "__main__":
     elif options.command == 'sync-parallel':
         sync_parallel(names_from_db(options.inventory_db), options)
     else:
-        assert False
+        assert False # argparse shouldn't let us get to this condition
