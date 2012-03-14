@@ -10,6 +10,7 @@ import argparse
 import sqlite3
 import multiprocessing, logging
 import Queue
+import tempfile
 
 logger = multiprocessing.log_to_stderr()
 logger.setLevel(multiprocessing.SUBDEBUG)
@@ -49,7 +50,33 @@ def sync_file(path, bucket, start_path, check_remote=True):
                 raise Exception( "MD5 mismatch... %s :: %s" % (local_hash, remote_hash) )
     logger.debug("UPLOADING " + path)
     gsutil('-m', 'cp', path, "gs://"+bucket+"/"+relpath)
+    #gsutil('cp', path, "gs://"+bucket+"/"+relpath)
     logger.debug("UPLOADED " +path)
+
+def transfer_dir_relative(path, bucket, root_path):
+    """  
+    Copy a given directory to a GCS bucket such that the object keys are all prefixed by 
+    each file's path relative to root_path.  gsutil can't do this on it's own so we need to 
+    create a temporary subtree on the filesystem representing the relative path and then
+    recursively transfer that subtree.
+    """
+    tmpdir = tempfile.mkdtemp()
+    relpath = os.path.relpath(path, root_path)
+    logger.info("Transferring: %s" % relpath)
+
+    os.makedirs(os.path.join(tmpdir, relpath))
+    links = []
+    for file in os.listdir(path):
+        if not os.path.isdir(os.path.join(path, file)):
+            os.symlink( os.path.join(path, file), os.path.join(tmpdir, relpath, file) )
+            links.append( os.path.join(tmpdir, relpath, file) )
+
+    gsutil('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
+
+    # Clean up
+    for link in links:
+        os.unlink(link)
+    os.removedirs(os.path.join(tmpdir, relpath)) # remove empty parents recursively
 
 def sync_recursive(source_dir, dest_bucket):
     """ Sync files from source path to dest_bucket on GCS."""
@@ -60,16 +87,28 @@ def sync_recursive(source_dir, dest_bucket):
         for filename in filenames:
             sync_file(os.path.join(dirpath, filename), dest_bucket, source_dir)
 
-def mark_complete(filepath, connection, dblock=None):
+def increment_string(s):
+    return s[:-1] + chr(ord(s[-1])+1)
+
+def set_path_status(filepath, connection, status_value=1, dblock=None):
+    """
+    Update a path's status in the inventory db.
+      NULL: unprocessed
+      -1: enqueued for upload
+      +1: upload complete 
+    """
     if dblock: dblock.acquire()
     cursor = connection.cursor()
     logger.debug("UPDATING: %s" % filepath)
-    cursor.execute('UPDATE files set remote_exists = 1 where path = ?', (filepath,))
-    logger.debug("UPDATED: %d" % cursor.rowcount)
-    assert cursor.rowcount == 1
+    if options.by_subdir:
+        # prefix search, equivalent to "WHERE path LIKE filepath%", but works around an apparent bug in sqlite3's optimizer, where the shorter form would skip the index
+        cursor.execute('UPDATE files SET Remote_exists = ? WHERE path > ? AND path < ?', (status_value, filepath, increment_string(filepath)) ) 
+    else:
+        cursor.execute('UPDATE files set remote_exists = ? where path = ?', (status_value, filepath))
+    logger.debug("UPDATED STATUS to %d: count %d" % (status_value,cursor.rowcount) )
     connection.commit()
     logger.debug("COMMITTED")
-    time.sleep(0.2)
+    cursor.close()
     if dblock: dblock.release()
 
 def worker(task_q, result_q, finished, dbname):
@@ -80,7 +119,10 @@ def worker(task_q, result_q, finished, dbname):
             path, dest_bucket, start_path = task_q.get(False, 0.1) # retry after a timeout
         except Queue.Empty:
             continue
-        sync_file(path, dest_bucket, start_path, check_remote=False)
+        if options.by_subdir:
+            transfer_dir_relative(path, dest_bucket, start_path)
+        else:
+            sync_file(path, dest_bucket, start_path, check_remote=False)
         result_q.put(path)
         task_q.task_done()
     
@@ -93,11 +135,13 @@ def db_reporter(q, finished, dbname):
             path = q.get(False, 0.1) # retry after a timeout
         except Queue.Empty:
             continue
-        mark_complete(path, connection)
+        set_path_status(path, connection)
         q.task_done()
 
 
 def sync_parallel(filename_iterator, options):
+    global connection
+    gsutil( "setdefacl", "public-read", "gs://"+dest_bucket) # make uploads world-readable
     response = None
     while response not in ('y','n'):
         response = raw_input("Do you want to run a remote inventory first?  You probably do, but it will take a while. (y/n)")
@@ -113,6 +157,7 @@ def sync_parallel(filename_iterator, options):
     for p in subprocesses:
         p.start()
     for path in filename_iterator:
+        set_path_status(path, connection, status_value=-1)
         task_q.put( (path, options.dest_bucket, options.source_dir) )
     task_q.join()
     result_q.join()
@@ -121,9 +166,14 @@ def sync_parallel(filename_iterator, options):
     for p in subprocesses:
         p.join()
 
+def get_subdirs(root_dir):
+    """ yield all the subdirectories of a path"""
+    for (dirpath, dirnames, filenames) in os.walk(root_dir):
+        yield dirpath
+
 def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
-    qry = "SELECT path FROM files"
+    qry = "SELECT id,path FROM files"
     if which != "all":
         qry += " WHERE remote_exists IS NULL"
     qry += " LIMIT %d" % options.db_chunk_size
@@ -136,7 +186,7 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         records = cursor.fetchall()
         if len(records) == 0: break
         for record in records:
-            yield record[0]
+            yield record[1]
         
 
 def search_for_gsutil():
@@ -201,7 +251,7 @@ def local_inventory(source_dir, bucketname):
         conn.commit()
     print "Creating index...",
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exist ON files(remote_exists);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
     print "Done."
 
 def remote_inventory(source_dir, bucketname, options):
@@ -249,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
     parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
+    parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.")
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=200)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
@@ -262,19 +313,30 @@ if __name__ == "__main__":
 
     connection = sqlite3.Connection(options.inventory_db)
 
+    # look for gsutil in some reasonable places if it's not provided at the command line
     global gsutil_path
     if options.gsutil_path:
         gsutil_path = options.gsutil_path
     else:
         gsutil_path = search_for_gsutil()
 
+    # Clear any pending-transfer status that may have been set if a previous run was aborted.
+    cursor = connection.cursor()
+    cursor.execute("UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
+    cursor.close; del cursor
+
     if options.command == 'local-inventory':
         local_inventory(options.source_dir, options.dest_bucket)
     elif options.command == 'remote-inventory':
         remote_inventory(options.source_dir, options.dest_bucket, options)
     elif options.command == 'sync-serial':
+        if options.by_subdir:
+            raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
     elif options.command == 'sync-parallel':
-        sync_parallel(names_from_db(options.inventory_db), options)
+        if options.by_subdir:
+            sync_parallel(get_subdirs(options.source_dir), options)
+        else:
+            sync_parallel(names_from_db(options.inventory_db), options)
     else:
         assert False # argparse shouldn't let us get to this condition
