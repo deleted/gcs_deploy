@@ -64,7 +64,9 @@ def transfer_dir_relative(path, bucket, root_path):
     relpath = os.path.relpath(path, root_path)
     logger.info("Transferring: %s" % relpath)
 
-    os.makedirs(os.path.join(tmpdir, relpath))
+    if relpath != '.':
+        os.makedirs(os.path.join(tmpdir, relpath))
+
     links = []
     for file in os.listdir(path):
         if not os.path.isdir(os.path.join(path, file)):
@@ -76,7 +78,8 @@ def transfer_dir_relative(path, bucket, root_path):
     # Clean up
     for link in links:
         os.unlink(link)
-    os.removedirs(os.path.join(tmpdir, relpath)) # remove empty parents recursively
+    if relpath != '.':
+        os.removedirs(os.path.join(tmpdir, relpath)) # remove empty parents recursively
 
 def sync_recursive(source_dir, dest_bucket):
     """ Sync files from source path to dest_bucket on GCS."""
@@ -97,16 +100,22 @@ def set_path_status(filepath, connection, status_value=1, dblock=None):
       -1: enqueued for upload
       +1: upload complete 
     """
+
+    # ensure we're dealing with the relative path, which is what's stored in the inventory db
+    if options.source_dir in filepath:
+        filepath = os.path.relpath(filepath, options.source_dir)
+
     if dblock: dblock.acquire()
     cursor = connection.cursor()
     logger.debug("UPDATING: %s" % filepath)
     if options.by_subdir:
         # prefix search, equivalent to "WHERE path LIKE filepath%", but works around an apparent bug in sqlite3's optimizer, where the shorter form would skip the index
-        cursor.execute('UPDATE files SET Remote_exists = ? WHERE path > ? AND path < ?', (status_value, filepath, increment_string(filepath)) ) 
+        cursor.execute('UPDATE files SET remote_exists = ? WHERE path > ? AND path < ?', (status_value, filepath, increment_string(filepath)) ) 
     else:
         cursor.execute('UPDATE files set remote_exists = ? where path = ?', (status_value, filepath))
     logger.debug("UPDATED STATUS to %d: count %d" % (status_value,cursor.rowcount) )
     connection.commit()
+    time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
     logger.debug("COMMITTED")
     cursor.close()
     if dblock: dblock.release()
@@ -117,6 +126,7 @@ def worker(task_q, result_q, finished, dbname):
             break
         try:
             path, dest_bucket, start_path = task_q.get(False, 0.1) # retry after a timeout
+            logger.debug("unqueued (%s, %s, %s)" % (path, dest_bucket, start_path) )
         except Queue.Empty:
             continue
         if options.by_subdir:
@@ -135,13 +145,13 @@ def db_reporter(q, finished, dbname):
             path = q.get(False, 0.1) # retry after a timeout
         except Queue.Empty:
             continue
-        set_path_status(path, connection)
+        set_path_status(path, connection, status_value=1)
         q.task_done()
 
 
 def sync_parallel(filename_iterator, options):
     global connection
-    gsutil( "setdefacl", "public-read", "gs://"+dest_bucket) # make uploads world-readable
+    gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
     while response not in ('y','n'):
         response = raw_input("Do you want to run a remote inventory first?  You probably do, but it will take a while. (y/n)")
@@ -167,9 +177,10 @@ def sync_parallel(filename_iterator, options):
         p.join()
 
 def get_subdirs(root_dir):
-    """ yield all the subdirectories of a path"""
+    """ yield all the subdirectories of a path that have files in them"""
     for (dirpath, dirnames, filenames) in os.walk(root_dir):
-        yield dirpath
+        if len(filenames) > 0:
+            yield dirpath
 
 def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
@@ -261,6 +272,7 @@ def remote_inventory(source_dir, bucketname, options):
     listfile_name = os.path.join(inventory_path, 'remote_list.txt')
     if not options.no_refresh:
         print "Fetching remote listing...",
+        sys.stdout.flush()
         with open(listfile_name, 'w') as listfile:
             #listfile.write(gsutil('ls', 'gs://'+bucketname))
             p = subprocess.Popen((gsutil_path, 'ls', 'gs://'+bucketname), stdout=subprocess.PIPE)
@@ -301,7 +313,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
     parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.")
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
-    parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=200)
+    parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
 
     options = parser.parse_args()
@@ -321,9 +333,12 @@ if __name__ == "__main__":
         gsutil_path = search_for_gsutil()
 
     # Clear any pending-transfer status that may have been set if a previous run was aborted.
+    print "Resetting enqueued transfers...",
     cursor = connection.cursor()
     cursor.execute("UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
+    connection.commit()
     cursor.close; del cursor
+    print "Done."
 
     if options.command == 'local-inventory':
         local_inventory(options.source_dir, options.dest_bucket)
