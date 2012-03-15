@@ -17,7 +17,38 @@ logger = multiprocessing.log_to_stderr()
 logger.setLevel(logging.INFO)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
-global gsutil_path
+dblock = multiprocessing.Lock() # Using a global database lock because sqlite locks agressively and sometimes takes some time to unlock.
+
+def patient(func):
+    delay = 1 # time to wait before retrying after encountering a lock
+    def wrapped(*args, **kwargs):
+        i = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except OperationalError as e:
+                if 'database is locked' in e.message:
+                    logger.error("Database is locked.  Retrying. (%d)" % i)
+                    time.sleep(delay)
+                    i += 1
+                    continue
+                else:
+                    raise
+    return wrapped
+
+class PatientCursor( sqlite3.Cursor ):
+    @patient
+    def execute(self, *args, **kwargs):
+        super(PatientCursor, self).execute(*args, **kwargs)
+
+class PatientConnection( sqlite3.Connection ):
+    @patient
+    def commit(self, *args, **kwargs):
+        super(PatientConnection, self).commit(*args, **kwargs)
+
+sqlite3.Cursor = PatientCursor # Monkey Patch
+sqlite3.Connection = PatientConnection # Monkey Patch
+        
 
 def gsutil(*args):
     args = (gsutil_path,) + args
@@ -121,13 +152,15 @@ def sync_recursive(source_dir, dest_bucket):
 def increment_string(s):
     return s[:-1] + chr(ord(s[-1])+1)
 
-def set_path_status(filepaths, connection, status_value=1, dblock=None):
+def set_path_status(filepaths, connection, status_value=1):
     """
     Update a path's status in the inventory db.
       NULL: unprocessed
       -1: enqueued for upload
       +1: upload complete 
     """
+    global dblock
+
     # enforce that filepaths is a sequence
     if isinstance(filepaths, basestring):
         filepaths = (filepaths, )
@@ -205,6 +238,7 @@ def sync_parallel(source_path_iterator, options):
     task_q = multiprocessing.JoinableQueue(options.max_queue_size)
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
     finished = multiprocessing.Event()
+    global dblock # using a global database lock, because sqlite locking is agressive and a bit sticky.
     subprocesses = [ multiprocessing.Process(target=worker, args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
     reporter = multiprocessing.Process(target=db_reporter, args=(result_q, finished, options.inventory_db) )
     subprocesses.append(reporter)
@@ -234,11 +268,12 @@ def names_from_db(dbname, which="untransfered", dblock=None):
     qry += " LIMIT %d" % options.db_chunk_size
     logger.debug( qry )
     while True:
-        cursor = connection.cursor()
         if dblock: dblock.acquire()
+        cursor = connection.cursor()
         cursor.execute(qry)
-        if dblock: dblock.release()
         records = cursor.fetchall()
+        cursor.close()
+        if dblock: dblock.release()
         if len(records) == 0: break
         for record in records:
             yield record[1]
@@ -408,8 +443,8 @@ if __name__ == "__main__":
         if options.by_subdir:
             sync_parallel(get_subdirs(options.source_dir), options)
         elif options.by_chunk:
-            sync_parallel(get_chunks(options.source_dir), options)
+            sync_parallel(get_chunks(options.source_dir, dblock=dblock), options)
         else:
-            sync_parallel(names_from_db(options.inventory_db), options)
+            sync_parallel(names_from_db(options.inventory_db, dblock=dblock), options)
     else:
         assert False # argparse shouldn't let us get to this condition
