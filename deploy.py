@@ -13,7 +13,8 @@ import Queue
 import tempfile
 
 logger = multiprocessing.log_to_stderr()
-logger.setLevel(multiprocessing.SUBDEBUG)
+#logger.setLevel(multiprocessing.SUBDEBUG)
+logger.setLevel(logging.INFO)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
 global gsutil_path
@@ -81,6 +82,33 @@ def transfer_dir_relative(path, bucket, root_path):
     if relpath != '.':
         os.removedirs(os.path.join(tmpdir, relpath)) # remove empty parents recursively
 
+def transfer_chunk(paths, bucket, root_path):
+    """  
+    Copy a given sequence of filenames to a GCS bucket such that the object keys are all prefixed by 
+    each file's path relative to root_path.  gsutil can't do this on it's own so we need to 
+    create a temporary subtree on the filesystem representing the relative path and then
+    recursively transfer that subtree.
+    """
+    tmpdir = tempfile.mkdtemp()
+    relpaths = ( os.path.relpath(path, root_path) for path in paths ) if root_path in paths[0] else paths # assuming they're either all absolute or all relative
+    logger.info("Transferring: %s and %d more..." % (relpaths[0], len(paths)-1) )
+
+    for relpath in relpaths:
+        try:
+            os.makedirs(os.path.join(tmpdir, os.path.dirname(relpath) ))
+        except OSError: pass
+
+    links = []
+    for relpath in relpaths:
+        if not os.path.isdir(os.path.join(root_path, relpath)):
+            os.symlink( os.path.join(root_path, relpath), os.path.join(tmpdir, relpath) )
+            links.append( os.path.join(tmpdir, relpath) )
+
+    gsutil('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
+
+    # Clean up
+    subprocess.check_call( ('rm', '-rf', tmpdir) )
+
 def sync_recursive(source_dir, dest_bucket):
     """ Sync files from source path to dest_bucket on GCS."""
     gsutil( "setdefacl", "public-read", "gs://"+dest_bucket) # make uploads world-readable
@@ -93,27 +121,41 @@ def sync_recursive(source_dir, dest_bucket):
 def increment_string(s):
     return s[:-1] + chr(ord(s[-1])+1)
 
-def set_path_status(filepath, connection, status_value=1, dblock=None):
+def set_path_status(filepaths, connection, status_value=1, dblock=None):
     """
     Update a path's status in the inventory db.
       NULL: unprocessed
       -1: enqueued for upload
       +1: upload complete 
     """
+    # enforce that filepaths is a sequence
+    if isinstance(filepaths, basestring):
+        filepaths = (filepaths, )
+
+    logging.info("Set status on %s and %d more" % (filepaths[0], len(filepaths)-1) )
 
     # ensure we're dealing with the relative path, which is what's stored in the inventory db
-    if options.source_dir in filepath:
-        filepath = os.path.relpath(filepath, options.source_dir)
+    # assuming that if one path is absolute, they all are
+    if options.source_dir in filepaths[0]:
+        filepaths = ( os.path.relpath(filepath, options.source_dir) for filepath in filepaths )
+
+    if options.by_subdir:
+        assert len(filepaths) == 1
+        abspath = os.path.join(options.source_dir, filepaths[0])
+        paths = []
+        for filename in os.listdir(abspath):
+            if not os.path.isdir(os.path.join(abspath, filename)):
+                paths.append( os.path.join( filepath, filename) if filepath != '.' else filename)
+    else:
+        paths = filepaths # assuming here that filepath is a sequence of paths to mark
 
     if dblock: dblock.acquire()
     cursor = connection.cursor()
-    logger.debug("UPDATING: %s" % filepath)
-    if options.by_subdir:
-        # prefix search, equivalent to "WHERE path LIKE filepath%", but works around an apparent bug in sqlite3's optimizer, where the shorter form would skip the index
-        cursor.execute('UPDATE files SET remote_exists = ? WHERE path > ? AND path < ?', (status_value, filepath, increment_string(filepath)) ) 
-    else:
-        cursor.execute('UPDATE files set remote_exists = ? where path = ?', (status_value, filepath))
-    logger.debug("UPDATED STATUS to %d: count %d" % (status_value,cursor.rowcount) )
+    for path in paths:
+        logger.debug("UPDATING: %s" % path)
+        cursor.execute('UPDATE files set remote_exists = ? where path = ?', (status_value, path))
+        assert cursor.rowcount == 1
+    logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(paths)) )
     connection.commit()
     time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
     logger.debug("COMMITTED")
@@ -131,6 +173,8 @@ def worker(task_q, result_q, finished, dbname):
             continue
         if options.by_subdir:
             transfer_dir_relative(path, dest_bucket, start_path)
+        elif options.by_chunk:
+            transfer_chunk(path, dest_bucket, start_path)
         else:
             sync_file(path, dest_bucket, start_path, check_remote=False)
         result_q.put(path)
@@ -149,7 +193,7 @@ def db_reporter(q, finished, dbname):
         q.task_done()
 
 
-def sync_parallel(filename_iterator, options):
+def sync_parallel(source_path_iterator, options):
     global connection
     gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
@@ -166,7 +210,7 @@ def sync_parallel(filename_iterator, options):
     subprocesses.append(reporter)
     for p in subprocesses:
         p.start()
-    for path in filename_iterator:
+    for path in source_path_iterator:
         set_path_status(path, connection, status_value=-1)
         task_q.put( (path, options.dest_bucket, options.source_dir) )
     task_q.join()
@@ -198,7 +242,17 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         if len(records) == 0: break
         for record in records:
             yield record[1]
-        
+
+def get_chunks(dbname, dblock=None):
+    path_generator =  names_from_db(dbname,  dblock=dblock)
+    while True:
+        paths = []
+        for i in range( options.db_chunk_size):
+            try:
+                paths.append( path_generator.next() )
+            except StopIteration: break
+        if len(paths) < 1: break
+        yield tuple(paths)
 
 def search_for_gsutil():
     # Search for gsutil executable in the $PATH
@@ -311,7 +365,8 @@ if __name__ == "__main__":
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
     parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
-    parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.")
+    parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.  This mode doesn't sync.  It just pushes.")
+    parser.add_argument('--by-chunk', action='store_true', default=False, help="For parallel sync, optimize by passing entire chunks to gsutil (of size db_chunk_size).")
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
@@ -322,7 +377,7 @@ if __name__ == "__main__":
     # derived options
     options.inventory_path = '.'+options.dest_bucket
     options.inventory_db = os.path.join(options.inventory_path, 'inventory.db')
-
+    
     connection = sqlite3.Connection(options.inventory_db)
 
     # look for gsutil in some reasonable places if it's not provided at the command line
@@ -349,8 +404,11 @@ if __name__ == "__main__":
             raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
     elif options.command == 'sync-parallel':
+        assert not options.by_subdir and options.by_chunk
         if options.by_subdir:
             sync_parallel(get_subdirs(options.source_dir), options)
+        elif options.by_chunk:
+            sync_parallel(get_chunks(options.source_dir), options)
         else:
             sync_parallel(names_from_db(options.inventory_db), options)
     else:
