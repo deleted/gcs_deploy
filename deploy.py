@@ -132,8 +132,10 @@ def transfer_chunk(paths, bucket, root_path):
     links = []
     for relpath in relpaths:
         if not os.path.isdir(os.path.join(root_path, relpath)):
-            os.symlink( os.path.join(root_path, relpath), os.path.join(tmpdir, relpath) )
-            links.append( os.path.join(tmpdir, relpath) )
+            symlink_target = os.path.join(tmpdir, relpath)
+            if os.path.exists(symlink_target): os.unlink(symlink_target) # some failure modes have resulted in the link already existing... duplicate records? reissued tmp dirs?
+            os.symlink( os.path.join(root_path, relpath), symlink_target )
+            links.append( symlink_target )
 
     gsutil('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
 
