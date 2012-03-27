@@ -188,7 +188,7 @@ def set_path_status(filepaths, connection, status_value=1):
     cursor = connection.cursor()
     for path in paths:
         logger.debug("UPDATING: %s" % path)
-        cursor.execute('UPDATE files set remote_exists = ? where path = ?', (status_value, path))
+        cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
         assert cursor.rowcount == 1
     logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(paths)) )
     connection.commit()
@@ -266,7 +266,7 @@ def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
     qry = "SELECT id,path FROM files"
     if which != "all":
-        qry += " WHERE remote_exists IS NULL"
+        qry += " WHERE transferred IS NULL"
     qry += " LIMIT %d" % options.db_chunk_size
     logger.debug( qry )
     while True:
@@ -332,7 +332,8 @@ def local_inventory(source_dir, bucketname):
         path TEXT NOT NULL,
         local_hash TEXT,
         remote_hash TEXT,
-        remote_exists INTEGER
+        remote_exists INTEGER,
+        transferred INTEGER
     );
     """)
     conn.commit()
@@ -354,6 +355,7 @@ def local_inventory(source_dir, bucketname):
     print "Creating index...",
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
     print "Done."
 
 def remote_inventory(source_dir, bucketname, options):
