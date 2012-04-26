@@ -5,15 +5,18 @@ import hashlib
 import os
 import sys
 import time
+import shlex
 import subprocess
 import argparse
 import sqlite3
 import multiprocessing, logging
 import Queue
 import tempfile
+import itertools
 
-logger = multiprocessing.log_to_stderr()
+#logger = multiprocessing.log_to_stderr()
 #logger.setLevel(multiprocessing.SUBDEBUG)
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
@@ -28,7 +31,7 @@ def patient(func):
                 return func(*args, **kwargs)
             except OperationalError as e:
                 if 'database is locked' in e.message:
-                    logger.error("Database is locked.  Retrying. (%d)" % i)
+                    logger.warning("Database is locked.  Retrying. (%d)" % i)
                     time.sleep(delay)
                     i += 1
                     continue
@@ -45,7 +48,6 @@ class PatientConnection( sqlite3.Connection ):
     @patient
     def commit(self, *args, **kwargs):
         super(PatientConnection, self).commit(*args, **kwargs)
-
 sqlite3.Cursor = PatientCursor # Monkey Patch
 sqlite3.Connection = PatientConnection # Monkey Patch
         
@@ -61,6 +63,40 @@ def md5_digest(filepath):
         for bytes in iter(lambda: f.read(128*md5.block_size), ''):
             md5.update(bytes)
     return md5.hexdigest()
+
+def touch(fname, times = None):
+    with file(fname, 'a'):
+        os.utime(fname, times)
+
+def list_modified_files(root_path, reference_file):
+    """
+    Search the filesystem, starting at root_path.
+    Return a list of all files in the subtree with modification date
+    greater than that of a reference file
+    """
+    args = (
+        'find',
+        root_path,
+        '-newer', reference_file
+    )
+    logging.debug(' '.join(args) )
+    args = shlex.split( ' '.join( args ) )
+    p = subprocess.Popen(args, stdout=subprocess.PIPE)
+    for line in p.stdout.readlines():
+        path = line.strip()
+        if not os.path.isdir(path):
+            logger.info("Modified: %s" % path)
+            yield path
+
+def show_modified(options):
+    sync_timestamp_file = options.sync_timestamp_file
+    if not os.path.exists( sync_timestamp_file ):
+        print "%s does not exist.  Aborting." % sync_timestamp_file
+        sys.exit(1)
+
+    for file in list_modified_files(options.source_dir, sync_timestamp_file):
+        print file
+        sys.stdout.flush()
 
 def sync_file(path, bucket, start_path, check_remote=True):
     logger.info( "SYNC " + path + "...")
@@ -187,8 +223,10 @@ def set_path_status(filepaths, connection, status_value=1):
     if dblock: dblock.acquire()
     cursor = connection.cursor()
     for path in paths:
+        ensure_db_record_exists(path, options, connection, cursor)
         logger.debug("UPDATING: %s" % path)
         cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
+        logger.debug("Query rowcount: "+str(cursor.rowcount))
         assert cursor.rowcount == 1
     logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(paths)) )
     connection.commit()
@@ -232,10 +270,10 @@ def sync_parallel(source_path_iterator, options):
     global connection
     gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
-    while response not in ('y','n'):
-        response = raw_input("Do you want to run a remote inventory first?  You probably do, but it will take a while. (y/n)")
-    if response =='y':
-        remote_inventory(options.source_dir, options.dest_bucket)
+#    while response not in ('y','n'):
+#        response = raw_input("Do you want to run a remote inventory first?  You probably do, but it will take a while. (y/n)")
+#    if response =='y':
+#        remote_inventory(options.source_dir, options.dest_bucket)
 
     task_q = multiprocessing.JoinableQueue(options.max_queue_size)
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
@@ -246,15 +284,16 @@ def sync_parallel(source_path_iterator, options):
     subprocesses.append(reporter)
     for p in subprocesses:
         p.start()
-    for path in source_path_iterator:
-        set_path_status(path, connection, status_value=-1)
-        task_q.put( (path, options.dest_bucket, options.source_dir) )
+    for paths in source_path_iterator:
+        set_path_status(paths, connection, status_value=-1)
+        task_q.put( (paths, options.dest_bucket, options.source_dir) )
     task_q.join()
     result_q.join()
     finished.set()
     logger.info("Finished.  Waiting for subprocesses to join")
     for p in subprocesses:
         p.join()
+
 
 def get_subdirs(root_dir):
     """ yield all the subdirectories of a path that have files in them"""
@@ -280,8 +319,7 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         for record in records:
             yield record[1]
 
-def get_chunks(dbname, dblock=None):
-    path_generator =  names_from_db(dbname,  dblock=dblock)
+def get_chunks(path_generator):
     while True:
         paths = []
         for i in range( options.db_chunk_size):
@@ -327,14 +365,14 @@ def local_inventory(source_dir, bucketname):
     cursor.execute("DROP TABLE IF EXISTS files;")
     cursor.execute("DROP INDEX IF EXISTS idx_path;")
     cursor.execute("""
-    CREATE TABLE files (
-        id INTEGER PRIMARY KEY,
-        path TEXT NOT NULL,
-        local_hash TEXT,
-        remote_hash TEXT,
-        remote_exists INTEGER,
-        transferred INTEGER
-    );
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            local_hash TEXT,
+            remote_hash TEXT,
+            remote_exists INTEGER,
+            transferred INTEGER
+        );
     """)
     conn.commit()
 
@@ -357,6 +395,19 @@ def local_inventory(source_dir, bucketname):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
     print "Done."
+
+def ensure_db_record_exists(path, options, connection, cursor=None):
+    if not cursor:
+        cursor = connection.cursor()
+    relpath = os.path.relpath(path, options.source_dir)
+    cursor.execute('SELECT id FROM files WHERE path=?', (relpath, ))
+    if cursor.rowcount > 0:
+        return True
+    cursor.execute('INSERT INTO files (path) VALUES (?);',  (relpath, ))
+    assert cursor.rowcount == 1
+    connection.commit()
+    return cursor.rowcount
+    
 
 def remote_inventory(source_dir, bucketname, options):
     inventory_path = options.inventory_path 
@@ -392,23 +443,18 @@ def remote_inventory(source_dir, bucketname, options):
     
 
 if __name__ == "__main__":
-    #parser = optparse.OptionParser()
-#    parser.add_option('--dir', dest="source_dir")
-#    parser.add_option('--bucket', dest="dest_bucket")
-#    parser.add_option('--gsutil-path', dest='gsutil_path')
-#    parser.add_option('--local-inventory', action='store_true', dest='local_inventory')
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync-serial', 'sync-parallel'])
+    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync-serial', 'sync-parallel', 'show-modified'])
     parser.add_argument('--dir', dest='source_dir', metavar='rood source directory', default=settings.OUTPUT_PATH_BASE)
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
     parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
     parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.  This mode doesn't sync.  It just pushes.")
-    parser.add_argument('--by-chunk', action='store_true', default=False, help="For parallel sync, optimize by passing entire chunks to gsutil (of size db_chunk_size).")
+    parser.add_argument('--by-chunk', action='store_true', default=True, help="For parallel sync, optimize by passing entire chunks to gsutil (of size db_chunk_size).")
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
+    parser.add_argument('--debug', action='store_true', default=False, help="Turn on debug logging.")
 
     options = parser.parse_args()
     print "%s --> %s" % (options.source_dir, options.dest_bucket)
@@ -416,7 +462,13 @@ if __name__ == "__main__":
     # derived options
     options.inventory_path = '.'+options.dest_bucket
     options.inventory_db = os.path.join(options.inventory_path, 'inventory.db')
+    options.sync_timestamp_file = os.path.join( options.inventory_path, 'last_sync' ) # this file exists solely to mark the time the last sync completed.
     
+    if options.debug:
+        logger.setLevel(logging.DEBUG)
+        multiprocessing.log_to_stderr().setLevel(multiprocessing.SUBDEBUG)
+
+
     connection = sqlite3.Connection(options.inventory_db)
 
     # look for gsutil in some reasonable places if it's not provided at the command line
@@ -434,21 +486,38 @@ if __name__ == "__main__":
     cursor.close; del cursor
     print "Done."
 
+    logging.debug("Start mode switching.")
+
     if options.command == 'local-inventory':
         local_inventory(options.source_dir, options.dest_bucket)
+    elif options.command == 'show-modified':
+        show_modified(options)
     elif options.command == 'remote-inventory':
         remote_inventory(options.source_dir, options.dest_bucket, options)
     elif options.command == 'sync-serial':
         if options.by_subdir:
             raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
+        touch( options.sync_timestamp_file ) # update last sync timestamp
     elif options.command == 'sync-parallel':
         assert not options.by_subdir and options.by_chunk
         if options.by_subdir:
-            sync_parallel(get_subdirs(options.source_dir), options)
+            path_generator = get_subdirs(options.source_dir)
         elif options.by_chunk:
-            sync_parallel(get_chunks(options.source_dir, dblock=dblock), options)
+            logging.debug("By chunk.")
+            if os.path.exists( options.sync_timestamp_file ):
+                # push everyting modified since the last sync
+                logging.debug("Using date-modified.")
+                modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
+                # TODO: pass modified1 to something that will prep the database...
+                # set modified files as untransferred and make records for new files
+                path_generator = get_chunks ( modified2 )
+            else:
+                logging.debug("Usinge names from db.")
+                path_generator = get_chunks( names_from_db(options.inventory_db, dblock=dblock) )
         else:
-            sync_parallel(names_from_db(options.inventory_db, dblock=dblock), options)
+            path_generator = names_from_db(options.inventory_db, dblock=dblock)
+        sync_parallel(path_generator, options)
+        touch( options.sync_timestamp_file ) # update last sync timestamp
     else:
         assert False # argparse shouldn't let us get to this condition
