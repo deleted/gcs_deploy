@@ -467,7 +467,7 @@ def remote_inventory(source_dir, bucketname, options):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync-serial', 'sync-parallel', 'show-modified'])
+    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-serial', 'sync-parallel', 'show-modified'])
     parser.add_argument('--dir', dest='source_dir', metavar='rood source directory', default=settings.OUTPUT_PATH_BASE)
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
@@ -525,7 +525,7 @@ if __name__ == "__main__":
             raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
         touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
-    elif options.command == 'sync-parallel':
+    elif options.command == 'sync-parallel' or options.command == 'sync':
         assert not options.by_subdir and options.by_chunk
         if options.by_subdir:
             path_generator = get_subdirs(options.source_dir, time=start_time)
