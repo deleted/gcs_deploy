@@ -152,8 +152,8 @@ def transfer_dir_relative(path, bucket, root_path):
     """  
     Copy a given directory to a GCS bucket such that the object keys are all prefixed by 
     each file's path relative to root_path.  gsutil can't do this on it's own so we need to 
-    create a temporary subtree on the filesystem representing the relative path and then
-    recursively transfer that subtree.
+    create a temporary subtree on the filesystem representing the relative path tree and 
+    then recursively transfer that subtree.
     """
     tmpdir = tempfile.mkdtemp()
     relpath = os.path.relpath(path, root_path)
@@ -180,8 +180,8 @@ def transfer_chunk(paths, bucket, root_path):
     """  
     Copy a given sequence of filenames to a GCS bucket such that the object keys are all prefixed by 
     each file's path relative to root_path.  gsutil can't do this on it's own so we need to 
-    create a temporary subtree on the filesystem representing the relative path and then
-    recursively transfer that subtree.
+    create a temporary subtree on the filesystem representing the relative path tree and 
+    then recursively transfer that subtree.
     """
     tmpdir = tempfile.mkdtemp()
     relpaths = ( os.path.relpath(path, root_path) for path in paths ) if root_path in paths[0] else paths # assuming they're either all absolute or all relative
@@ -346,6 +346,9 @@ def names_from_db(dbname, which="untransfered", dblock=None):
             yield record[1]
 
 def get_chunks(path_generator):
+    """
+    Group the output of path_generator into tuples of length options.db_chunk_size.
+    """
     while True:
         paths = []
         for i in range( options.db_chunk_size):
@@ -376,6 +379,10 @@ def ensure_exists(dirname):
         os.mkdir(dirname)
 
 def local_inventory(source_dir, bucketname):
+    """
+    Walk the local filesystem starting at source_dir and create a database cataloging the files in that
+    directory tree.
+    """
     if os.path.exists(options.inventory_db):
         response = None   
         while response not in ('y','n'):
@@ -421,6 +428,11 @@ def local_inventory(source_dir, bucketname):
     print "Done."
 
 def remote_inventory(source_dir, bucketname, options):
+    """
+    Fetch the complete list of files that exist in the GCS bucket.
+    Scan that list and mark all the corresponding records in the iventory database as
+    existent on the remote side.
+    """
     inventory_path = options.inventory_path 
     assert os.path.exists(options.inventory_db)
 
