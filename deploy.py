@@ -64,9 +64,12 @@ def md5_digest(filepath):
             md5.update(bytes)
     return md5.hexdigest()
 
-def touch(fname, times = None):
+def touch(fname, times=None, time=None):
+    if time and not times:
+        # set atime and mtime both equal to time
+        times = (time, time)
     with file(fname, 'a'):
-        os.utime(fname, times)
+        os.utime(fname, times) # times is None for current time, or a tuple of timestamps: (atime, mtime)
 
 def list_modified_files(root_path, reference_file):
     """
@@ -74,6 +77,7 @@ def list_modified_files(root_path, reference_file):
     Return a list of all files in the subtree with modification date
     greater than that of a reference file
     """
+    logger.info( "Searching for files modified since: %s" % time.ctime(os.path.getmtime( reference_file )) )
     args = (
         'find',
         root_path,
@@ -85,8 +89,9 @@ def list_modified_files(root_path, reference_file):
     for line in p.stdout.readlines():
         path = line.strip()
         if not os.path.isdir(path):
-            logger.info("Modified: %s" % path)
-            yield path
+            relpath = os.path.relpath(path, root_path)
+            logger.info("Found modified file: %s" % relpath)
+            yield relpath
 
 def show_modified(options):
     sync_timestamp_file = options.sync_timestamp_file
@@ -97,6 +102,28 @@ def show_modified(options):
     for file in list_modified_files(options.source_dir, sync_timestamp_file):
         print file
         sys.stdout.flush()
+
+def prep_db_for_update( connection, path_iterator ):
+    """
+    path_iterator here is a list of files that have been modified.
+    Prior to initiating the transfer, mark all these files as untransferred in the database,
+    creating records if they don't already exist.
+    """
+    logger.info("Prepping DB for date-based update.")
+    cursor = connection.cursor()
+    old = new = 0
+    for path in path_iterator:
+        cursor.execute("SELECT count(id) FROM files WHERE path = ?", (path,) )
+        if int(cursor.fetchone()[0]) > 0:
+            cursor.execute( 'UPDATE files SET transferred = 0 WHERE path = ?', (path,) )
+            old += 1
+        else:
+            cursor.execute('INSERT INTO files (path, transferred) VALUES (?,?);',  (path, 0) )
+            new += 1
+    logger.info("Will update %d existing files and add %d new files." % (old, new) )
+    connection.commit()
+    cursor.close()
+    logger.debug("Committed DB prep.")
 
 def sync_file(path, bucket, start_path, check_remote=True):
     logger.info( "SYNC " + path + "...")
@@ -223,7 +250,6 @@ def set_path_status(filepaths, connection, status_value=1):
     if dblock: dblock.acquire()
     cursor = connection.cursor()
     for path in paths:
-        ensure_db_record_exists(path, options, connection, cursor)
         logger.debug("UPDATING: %s" % path)
         cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
         logger.debug("Query rowcount: "+str(cursor.rowcount))
@@ -396,19 +422,6 @@ def local_inventory(source_dir, bucketname):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
     print "Done."
 
-def ensure_db_record_exists(path, options, connection, cursor=None):
-    if not cursor:
-        cursor = connection.cursor()
-    relpath = os.path.relpath(path, options.source_dir)
-    cursor.execute('SELECT id FROM files WHERE path=?', (relpath, ))
-    if cursor.rowcount > 0:
-        return True
-    cursor.execute('INSERT INTO files (path) VALUES (?);',  (relpath, ))
-    assert cursor.rowcount == 1
-    connection.commit()
-    return cursor.rowcount
-    
-
 def remote_inventory(source_dir, bucketname, options):
     inventory_path = options.inventory_path 
     assert os.path.exists(options.inventory_db)
@@ -478,12 +491,15 @@ if __name__ == "__main__":
     else:
         gsutil_path = search_for_gsutil()
 
+    start_time = time.time()
+
     # Clear any pending-transfer status that may have been set if a previous run was aborted.
     print "Resetting enqueued transfers...",
     cursor = connection.cursor()
     cursor.execute("UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
     connection.commit()
-    cursor.close; del cursor
+    cursor.close()
+    del cursor
     print "Done."
 
     logging.debug("Start mode switching.")
@@ -498,19 +514,18 @@ if __name__ == "__main__":
         if options.by_subdir:
             raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
-        touch( options.sync_timestamp_file ) # update last sync timestamp
+        touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
     elif options.command == 'sync-parallel':
         assert not options.by_subdir and options.by_chunk
         if options.by_subdir:
-            path_generator = get_subdirs(options.source_dir)
+            path_generator = get_subdirs(options.source_dir, time=start_time)
         elif options.by_chunk:
             logging.debug("By chunk.")
             if os.path.exists( options.sync_timestamp_file ):
                 # push everyting modified since the last sync
                 logging.debug("Using date-modified.")
                 modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
-                # TODO: pass modified1 to something that will prep the database...
-                # set modified files as untransferred and make records for new files
+                prep_db_for_update( connection, modified1 ) # make sure all the db records exist
                 path_generator = get_chunks ( modified2 )
             else:
                 logging.debug("Usinge names from db.")
