@@ -371,11 +371,9 @@ def search_for_gsutil():
     else:
         raise Exception("Couldn't find gsutil in your $PATH.  Please add it or specify it with the --gsutil-path option.")
     
-def ensure_exists(path):
-    try:
-        os.mkdir(path)
-    except OSError: #presumably directory already exists
-        pass
+def ensure_exists(dirname):
+    if not os.path.exists(dirname):
+        os.mkdir(dirname)
 
 def local_inventory(source_dir, bucketname):
     if os.path.exists(options.inventory_db):
