@@ -148,34 +148,6 @@ def sync_file(path, bucket, start_path, check_remote=True):
     #gsutil('cp', path, "gs://"+bucket+"/"+relpath)
     logger.debug("UPLOADED " +path)
 
-def transfer_dir_relative(path, bucket, root_path):
-    """  
-    Copy a given directory to a GCS bucket such that the object keys are all prefixed by 
-    each file's path relative to root_path.  gsutil can't do this on it's own so we need to 
-    create a temporary subtree on the filesystem representing the relative path tree and 
-    then recursively transfer that subtree.
-    """
-    tmpdir = tempfile.mkdtemp()
-    relpath = os.path.relpath(path, root_path)
-    logger.info("Transferring: %s" % relpath)
-
-    if relpath != '.':
-        os.makedirs(os.path.join(tmpdir, relpath))
-
-    links = []
-    for file in os.listdir(path):
-        if not os.path.isdir(os.path.join(path, file)):
-            os.symlink( os.path.join(path, file), os.path.join(tmpdir, relpath, file) )
-            links.append( os.path.join(tmpdir, relpath, file) )
-
-    gsutil('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
-
-    # Clean up
-    for link in links:
-        os.unlink(link)
-    if relpath != '.':
-        os.removedirs(os.path.join(tmpdir, relpath)) # remove empty parents recursively
-
 def transfer_chunk(paths, bucket, root_path):
     """  
     Copy a given sequence of filenames to a GCS bucket such that the object keys are all prefixed by 
@@ -237,24 +209,14 @@ def set_path_status(filepaths, connection, status_value=1):
     if options.source_dir in filepaths[0]:
         filepaths = ( os.path.relpath(filepath, options.source_dir) for filepath in filepaths )
 
-    if options.by_subdir:
-        assert len(filepaths) == 1
-        abspath = os.path.join(options.source_dir, filepaths[0])
-        paths = []
-        for filename in os.listdir(abspath):
-            if not os.path.isdir(os.path.join(abspath, filename)):
-                paths.append( os.path.join( filepath, filename) if filepath != '.' else filename)
-    else:
-        paths = filepaths # assuming here that filepath is a sequence of paths to mark
-
     if dblock: dblock.acquire()
     cursor = connection.cursor()
-    for path in paths:
+    for path in filepaths:
         logger.debug("UPDATING: %s" % path)
         cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
         logger.debug("Query rowcount: "+str(cursor.rowcount))
         assert cursor.rowcount == 1
-    logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(paths)) )
+    logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(filepaths)) )
     connection.commit()
     time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
     logger.debug("COMMITTED")
@@ -270,9 +232,7 @@ def worker(task_q, result_q, finished, dbname):
             logger.debug("unqueued (%s, %s, %s)" % (path, dest_bucket, start_path) )
         except Queue.Empty:
             continue
-        if options.by_subdir:
-            transfer_dir_relative(path, dest_bucket, start_path)
-        elif options.by_chunk:
+        if options.by_chunk:
             transfer_chunk(path, dest_bucket, start_path)
         else:
             sync_file(path, dest_bucket, start_path, check_remote=False)
@@ -319,13 +279,6 @@ def sync_parallel(source_path_iterator, options):
     logger.info("Finished.  Waiting for subprocesses to join")
     for p in subprocesses:
         p.join()
-
-
-def get_subdirs(root_dir):
-    """ yield all the subdirectories of a path that have files in them"""
-    for (dirpath, dirnames, filenames) in os.walk(root_dir):
-        if len(filenames) > 0:
-            yield dirpath
 
 def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
@@ -472,7 +425,6 @@ if __name__ == "__main__":
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
     parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
-    parser.add_argument('--by-subdir', action='store_true', default=False, help="For parallel sync, optimize by passing entire subdirectories to gsutil.  This mode doesn't sync.  It just pushes.")
     parser.add_argument('--by-chunk', action='store_true', default=True, help="For parallel sync, optimize by passing entire chunks to gsutil (of size db_chunk_size).")
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
@@ -521,15 +473,10 @@ if __name__ == "__main__":
     elif options.command == 'remote-inventory':
         remote_inventory(options.source_dir, options.dest_bucket, options)
     elif options.command == 'sync-serial':
-        if options.by_subdir:
-            raise Exception("--by-subdir is only implemented in parallel sync mode.")
         sync_recursive(options.source_dir, options.dest_bucket)
         touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
     elif options.command == 'sync-parallel' or options.command == 'sync':
-        assert not options.by_subdir and options.by_chunk
-        if options.by_subdir:
-            path_generator = get_subdirs(options.source_dir, time=start_time)
-        elif options.by_chunk:
+        if options.by_chunk:
             logging.debug("By chunk.")
             if os.path.exists( options.sync_timestamp_file ):
                 # push everyting modified since the last sync
