@@ -282,12 +282,16 @@ def sync_parallel(source_path_iterator, options):
 
 def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
-    qry = "SELECT id,path FROM files"
-    if which != "all":
-        qry += " WHERE transferred != 1"
-    qry += " LIMIT %d" % options.db_chunk_size
-    logger.debug( qry )
+    last_max_id = -9999
     while True:
+        qry = "SELECT id,path FROM files"
+        qry += " WHERE id > %d " % last_max_id
+        if which != "all":
+            qry += " AND ( transferred IS NULL OR transferred != 1)"
+        qry += " ORDER BY id "
+        qry += " LIMIT %d" % options.db_chunk_size
+        logger.debug( qry )
+
         if dblock: dblock.acquire()
         cursor = connection.cursor()
         cursor.execute(qry)
@@ -297,6 +301,8 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         if len(records) == 0: break
         for record in records:
             yield record[1]
+        else:
+            last_max_id = int(record[0])
 
 def get_chunks(path_generator):
     """
