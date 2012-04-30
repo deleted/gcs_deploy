@@ -284,7 +284,7 @@ def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
     qry = "SELECT id,path FROM files"
     if which != "all":
-        qry += " WHERE transferred IS NULL"
+        qry += " WHERE transferred != 1"
     qry += " LIMIT %d" % options.db_chunk_size
     logger.debug( qry )
     while True:
@@ -421,11 +421,16 @@ def remote_inventory(source_dir, bucketname, options):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-serial', 'sync-parallel', 'show-modified'])
+
     parser.add_argument('--dir', dest='source_dir', metavar='rood source directory', default=settings.OUTPUT_PATH_BASE)
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
     parser.add_argument('--gsutil-path', dest='gsutil_path')
-    parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
     parser.add_argument('--by-chunk', action='store_true', default=True, help="For parallel sync, optimize by passing entire chunks to gsutil (of size db_chunk_size).")
+
+    parser.add_argument('--no-refresh', action='store_true', default=False, help="For remote inventory, don't refresh the GCS listing, just do the db updates.")
+    parser.add_argument('--skip-db', dest='use_db', action='store_false', default=True, help="On sync, don't look for untransferred files in the DB.")
+    parser.add_argument('--skip-modtime', dest='use_modtime', action='store_false', default=True, help="On sync, don't look for files modified since the last sync.") 
+
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
@@ -473,23 +478,29 @@ if __name__ == "__main__":
     elif options.command == 'remote-inventory':
         remote_inventory(options.source_dir, options.dest_bucket, options)
     elif options.command == 'sync-serial':
-        sync_recursive(options.source_dir, options.dest_bucket)
-        touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
+        #sync_recursive(options.source_dir, options.dest_bucket)
+        #touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
+        raise NotImplementedError("You probably want sync-parallel")
     elif options.command == 'sync-parallel' or options.command == 'sync':
+        path_sources = []
+        if options.use_db:
+            logging.debug("use_db: Getting untransferred files from the db.")
+            path_sources.append( names_from_db(options.inventory_db, dblock=dblock) )
+        if options.use_modtime:
+            logging.debug("use_modtime: Checking for modified files.")
+            modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
+            prep_db_for_update( connection, modified1 ) # make sure all the db records exist
+            path_sources.append( get_chunks ( modified2 ) )
+
+        path_generator = itertools.chain( *path_sources )
+
         if options.by_chunk:
-            logging.debug("By chunk.")
-            if os.path.exists( options.sync_timestamp_file ):
-                # push everyting modified since the last sync
-                logging.debug("Using date-modified.")
-                modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
-                prep_db_for_update( connection, modified1 ) # make sure all the db records exist
-                path_generator = get_chunks ( modified2 )
-            else:
-                logging.debug("Usinge names from db.")
-                path_generator = get_chunks( names_from_db(options.inventory_db, dblock=dblock) )
-        else:
-            path_generator = names_from_db(options.inventory_db, dblock=dblock)
+            path_generator = get_chunks( path_generator )
+            
         sync_parallel(path_generator, options)
-        touch( options.sync_timestamp_file ) # update last sync timestamp
+
+        if options.use_modtime: # only touch the timestamp file if we used modtime for the sync
+            touch( options.sync_timestamp_file ) # update last sync timestamp
+
     else:
         assert False # argparse shouldn't let us get to this condition
