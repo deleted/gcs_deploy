@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.6
 import settings
 import httplib
 import hashlib
@@ -18,6 +18,11 @@ import itertools
 #logger.setLevel(multiprocessing.SUBDEBUG)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+hdlr = logging.FileHandler('deploy.log')
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+hdlr.setFormatter(formatter)
+logger.addHandler(hdlr)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
 dblock = multiprocessing.Lock() # Using a global database lock because sqlite locks agressively and sometimes takes some time to unlock.
@@ -75,8 +80,10 @@ def list_modified_files(root_path, reference_file):
     """
     Search the filesystem, starting at root_path.
     Return a list of all files in the subtree with modification date
-    greater than that of a reference file
+    greater than that of a reference file.'-rf', tmpdir
+    Cache the find results to a file so that it can be resumed next time.
     """
+    #modified_files_log = os.path.join(options.inventory_path, 'modified-files')
     logger.info( "Searching for files modified since: %s" % time.ctime(os.path.getmtime( reference_file )) )
     args = (
         'find',
@@ -92,6 +99,8 @@ def list_modified_files(root_path, reference_file):
             relpath = os.path.relpath(path, root_path)
             logger.info("Found modified file: %s" % relpath)
             yield relpath
+    else:
+        logger.info("FIND iterator is exhausted.")
 
 def show_modified(options):
     sync_timestamp_file = options.sync_timestamp_file
@@ -171,10 +180,13 @@ def transfer_chunk(paths, bucket, root_path):
             if os.path.exists(symlink_target): os.unlink(symlink_target) # some failure modes have resulted in the link already existing... duplicate records? reissued tmp dirs?
             os.symlink( os.path.join(root_path, relpath), symlink_target )
             links.append( symlink_target )
+            logger.debug("Added symlink: " + symlink_target)
 
-    gsutil('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
+    args = ('-m', 'cp', '-R', os.path.join(tmpdir, '*'), 'gs://'+bucket)
+    gsutil(*args)
 
     # Clean up
+    logger.info("Deleting tmpdir: "+tmpdir)
     subprocess.check_call( ('rm', '-rf', tmpdir) )
 
 def sync_recursive(source_dir, dest_bucket):
@@ -209,7 +221,10 @@ def set_path_status(filepaths, connection, status_value=1):
     if options.source_dir in filepaths[0]:
         filepaths = ( os.path.relpath(filepath, options.source_dir) for filepath in filepaths )
 
-    if dblock: dblock.acquire()
+    if dblock: 
+        logger.debug("acquiring database lock.")
+        dblock.acquire()
+        logger.debug("database lock acquired.")
     cursor = connection.cursor()
     for path in filepaths:
         logger.debug("UPDATING: %s" % path)
@@ -224,20 +239,28 @@ def set_path_status(filepaths, connection, status_value=1):
     if dblock: dblock.release()
 
 def worker(task_q, result_q, finished, dbname):
+    q_empty_logged = False
     while True:
         if finished.is_set():
             break
         try:
-            path, dest_bucket, start_path = task_q.get(False, 0.1) # retry after a timeout
-            logger.debug("unqueued (%s, %s, %s)" % (path, dest_bucket, start_path) )
+            job_number, path, dest_bucket, start_path = task_q.get(False, 0.1) # retry after a timeout
+            #logger.debug("unqueued (%s, %s, %s)" % (path, dest_bucket, start_path) )
+            logger.debug("unqueued job %d" % job_number)
+            q_empty_logged = False
         except Queue.Empty:
+            if not q_empty_loged:
+                logger.debug("Task queue empty.")
+                q_empty_logged = True
             continue
         if options.by_chunk:
             transfer_chunk(path, dest_bucket, start_path)
         else:
             sync_file(path, dest_bucket, start_path, check_remote=False)
+        logger.debug("finisehd job %d" % job_number)
         result_q.put(path)
         task_q.task_done()
+        logger.debug("job %d results delivered" % job_number)
     
 def db_reporter(q, finished, dbname):
     connection = sqlite3.Connection(dbname)
@@ -253,6 +276,7 @@ def db_reporter(q, finished, dbname):
 
 
 def sync_parallel(source_path_iterator, options):
+    logger.info("Beginning parallel sync.")
     global connection
     gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
@@ -265,20 +289,26 @@ def sync_parallel(source_path_iterator, options):
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
     finished = multiprocessing.Event()
     global dblock # using a global database lock, because sqlite locking is agressive and a bit sticky.
+    logger.debug("Initializing subprocesses")
     subprocesses = [ multiprocessing.Process(target=worker, args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
     reporter = multiprocessing.Process(target=db_reporter, args=(result_q, finished, options.inventory_db) )
     subprocesses.append(reporter)
+    logger.debug("Starting subprocesses")
     for p in subprocesses:
         p.start()
+    job_number = 0
     for paths in source_path_iterator:
+        job_number += 1
         set_path_status(paths, connection, status_value=-1)
-        task_q.put( (paths, options.dest_bucket, options.source_dir) )
+        task_q.put( (job_number, paths, options.dest_bucket, options.source_dir) )
+        logger.debug("Put job #%d into task_q" % job_number)
     task_q.join()
     result_q.join()
     finished.set()
     logger.info("Finished.  Waiting for subprocesses to join")
     for p in subprocesses:
         p.join()
+    logger.info("All subprocesses joined.")
 
 def names_from_db(dbname, which="untransfered", dblock=None):
     global connection
