@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import argparse
 import sqlite3
-import multiprocessing, logging
+import multiprocessing, logging, logging.handlers
 import Queue
 import tempfile
 import itertools
@@ -19,7 +19,8 @@ import itertools
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-hdlr = logging.FileHandler('deploy.log')
+hdlr = logging.handlers.RotatingFileHandler('deploy.log', backupCount=1, maxBytes=0)
+hdlr.doRollover()
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 hdlr.setFormatter(formatter)
 logger.addHandler(hdlr)
@@ -249,7 +250,7 @@ def worker(task_q, result_q, finished, dbname):
             logger.debug("unqueued job %d" % job_number)
             q_empty_logged = False
         except Queue.Empty:
-            if not q_empty_loged:
+            if not q_empty_logged:
                 logger.debug("Task queue empty.")
                 q_empty_logged = True
             continue
