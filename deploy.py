@@ -237,7 +237,8 @@ def set_path_status(filepaths, connection, status_value=1):
     time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
     logger.debug("COMMITTED")
     cursor.close()
-    if dblock: dblock.release()
+    if dblock: 
+        dblock.release()
 
 def worker(task_q, result_q, finished, dbname):
     q_empty_logged = False
@@ -250,7 +251,7 @@ def worker(task_q, result_q, finished, dbname):
             logger.debug("unqueued job %d" % job_number)
             q_empty_logged = False
         except Queue.Empty:
-            if not q_empty_logged:
+            if (not q_empty_logged):
                 logger.debug("Task queue empty.")
                 q_empty_logged = True
             continue
@@ -258,7 +259,7 @@ def worker(task_q, result_q, finished, dbname):
             transfer_chunk(path, dest_bucket, start_path)
         else:
             sync_file(path, dest_bucket, start_path, check_remote=False)
-        logger.debug("finisehd job %d" % job_number)
+        logger.debug("finished job %d" % job_number)
         result_q.put(path)
         task_q.task_done()
         logger.debug("job %d results delivered" % job_number)
@@ -300,18 +301,33 @@ def sync_parallel(source_path_iterator, options):
     job_number = 0
     for paths in source_path_iterator:
         job_number += 1
+        logger.debug("Setting up job #%d" % job_number)
         set_path_status(paths, connection, status_value=-1)
         task_q.put( (job_number, paths, options.dest_bucket, options.source_dir) )
         logger.debug("Put job #%d into task_q" % job_number)
+    else:
+        logger.debug("source_path_iterator exhausted")
+    logger.debug("Waiting for task_q to join.")
     task_q.join()
+    logger.debug("Waiting for result_q to join.")
     result_q.join()
+    logger.debug("Setting the finished event")
     finished.set()
     logger.info("Finished.  Waiting for subprocesses to join")
     for p in subprocesses:
         p.join()
     logger.info("All subprocesses joined.")
 
-def names_from_db(dbname, which="untransfered", dblock=None):
+def mark_for_deletion(record_id, relpath, dblock):
+    logger.info("%s does not exist.  Marking for deletion." % relpath)
+    if dblock: dblock.acquire() 
+    global connection
+    cursor = connection.cursor()
+    cursor.execute("UPDATE files SET local_deleted = 1 where id = %d" % record_id)
+    cursor.close()
+    if dblock: dblock.release() 
+
+def names_from_db(dbname, which="untransfered", dblock=None, exclude_deleted=True):
     global connection
     last_max_id = -9999
     while True:
@@ -319,6 +335,8 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         qry += " WHERE id > %d " % last_max_id
         if which != "all":
             qry += " AND ( transferred IS NULL OR transferred != 1)"
+        if exclude_deleted:
+            qry += " AND local_deleted != 1"
         qry += " ORDER BY id "
         qry += " LIMIT %d" % options.db_chunk_size
         logger.debug( qry )
@@ -329,9 +347,13 @@ def names_from_db(dbname, which="untransfered", dblock=None):
         records = cursor.fetchall()
         cursor.close()
         if dblock: dblock.release()
-        if len(records) == 0: break
+        if len(records) == 0: 
+            break
         for record in records:
-            yield record[1]
+            if os.path.exists( os.path.join(options.source_dir, record[1]) ):
+                yield record[1]
+            else:
+                mark_for_deletion( record[0], record[1], dblock )
         else:
             last_max_id = int(record[0])
 
@@ -344,8 +366,12 @@ def get_chunks(path_generator):
         for i in range( options.db_chunk_size):
             try:
                 paths.append( path_generator.next() )
-            except StopIteration: break
-        if len(paths) < 1: break
+            except StopIteration:
+                logger.debug("get_chunks encountered StopIteration")
+                break
+        if len(paths) < 1:
+            break
+        logger.debug("get_chunks yielding %d paths" % len(paths) )
         yield tuple(paths)
 
 def search_for_gsutil():
@@ -392,7 +418,8 @@ def local_inventory(source_dir, bucketname):
             local_hash TEXT,
             remote_hash TEXT,
             remote_exists INTEGER,
-            transferred INTEGER
+            transferred INTEGER,
+            local_deleted INTEGER DEFAULT 0,
         );
     """)
     conn.commit()
@@ -415,6 +442,7 @@ def local_inventory(source_dir, bucketname):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_delete ON files(local_deleted);')
     print "Done."
 
 def remote_inventory(source_dir, bucketname, options):
@@ -527,11 +555,14 @@ if __name__ == "__main__":
             logging.debug("use_modtime: Checking for modified files.")
             modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
             prep_db_for_update( connection, modified1 ) # make sure all the db records exist
-            path_sources.append( get_chunks ( modified2 ) )
+            #path_sources.append( get_chunks ( modified2 ) )
+            path_sources.append(  modified2 ) 
 
+        logger.info("Chaining from %d path sources" % len(path_sources))
         path_generator = itertools.chain( *path_sources )
 
         if options.by_chunk:
+            logger.info( "Chunking chained path sources." )
             path_generator = get_chunks( path_generator )
             
         sync_parallel(path_generator, options)
