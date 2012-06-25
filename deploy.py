@@ -21,12 +21,28 @@ logger.setLevel(logging.INFO)
 
 hdlr = logging.handlers.RotatingFileHandler('deploy.log', backupCount=1, maxBytes=0)
 hdlr.doRollover()
-formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+formatter = logging.Formatter('%(asctime)s %(thread)d:%(lineno)d %(levelname)s %(message)s')
 hdlr.setFormatter(formatter)
 logger.addHandler(hdlr)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
+
 dblock = multiprocessing.Lock() # Using a global database lock because sqlite locks agressively and sometimes takes some time to unlock.
+
+# Logging DB lock for debugging
+_acquire = dblock.acquire
+_release = dblock.release
+def acquire(*args, **kwargs):
+    time.sleep(0.2)
+    _acquire(*args, **kwargs)
+    logger.debug("Lock acquired.")
+def release( *args, **kwargs):
+    time.sleep(0.2)
+    _release( *args, **kwargs)
+    logger.debug("Lock released.")
+dblock.acquire = acquire
+dblock.release = release
+    
 
 def patient(func):
     delay = 1 # time to wait before retrying after encountering a lock
@@ -35,7 +51,7 @@ def patient(func):
         while True:
             try:
                 return func(*args, **kwargs)
-            except OperationalError as e:
+            except sqlite3.OperationalError as e:
                 if 'database is locked' in e.message:
                     logger.warning("Database is locked.  Retrying. (%d)" % i)
                     time.sleep(delay)
@@ -48,15 +64,21 @@ def patient(func):
 class PatientCursor( sqlite3.Cursor ):
     @patient
     def execute(self, *args, **kwargs):
+        logger.debug("PatientCursor.execute(): " + str(args))
         super(PatientCursor, self).execute(*args, **kwargs)
 
 class PatientConnection( sqlite3.Connection ):
     @patient
     def commit(self, *args, **kwargs):
+        logger.debug("PatientConnection.commit().")
         super(PatientConnection, self).commit(*args, **kwargs)
-sqlite3.Cursor = PatientCursor # Monkey Patch
+sqlite3.Cursor = PatientCursor # Monkey Patch THIS DOESNT WORK, SINCE THE CURSOR IS INSTANTIATED IN A C MODULE
 sqlite3.Connection = PatientConnection # Monkey Patch
-        
+
+@patient
+def patient_execute(cursor, *args, **kwargs):
+    logger.debug("Patiently executing: %s" % args[0])
+    return cursor.execute(*args, **kwargs)       
 
 def gsutil(*args):
     args = (gsutil_path,) + args
@@ -84,7 +106,14 @@ def list_modified_files(root_path, reference_file):
     greater than that of a reference file.'-rf', tmpdir
     Cache the find results to a file so that it can be resumed next time.
     """
-    #modified_files_log = os.path.join(options.inventory_path, 'modified-files')
+    modified_files_log = os.path.join(options.inventory_path, 'modified-files')
+    if options.recycle and os.path.exists(modified_files_log):
+        logger.info("skipping FIND and reusing %s" % modified_files_log)
+        with open(modified_files_log, 'r') as infile:
+            for line in infile:
+                yield line
+        return
+
     logger.info( "Searching for files modified since: %s" % time.ctime(os.path.getmtime( reference_file )) )
     args = (
         'find',
@@ -94,14 +123,18 @@ def list_modified_files(root_path, reference_file):
     logging.debug(' '.join(args) )
     args = shlex.split( ' '.join( args ) )
     p = subprocess.Popen(args, stdout=subprocess.PIPE)
-    for line in p.stdout.readlines():
-        path = line.strip()
-        if not os.path.isdir(path):
-            relpath = os.path.relpath(path, root_path)
-            logger.info("Found modified file: %s" % relpath)
-            yield relpath
-    else:
-        logger.info("FIND iterator is exhausted.")
+    i = 0
+    with open(modified_files_log, 'w') as logfile:
+        for line in p.stdout.readlines():
+            path = line.strip()
+            if not os.path.isdir(path):
+                i += 1
+                relpath = os.path.relpath(path, root_path)
+                logger.info("Found modified file: %s" % relpath)
+                logfile.write(relpath + "\n")
+                yield relpath
+        else:
+            logger.info("FIND iterator is exhausted (%d paths yielded)." % i)
 
 def show_modified(options):
     sync_timestamp_file = options.sync_timestamp_file
@@ -113,27 +146,32 @@ def show_modified(options):
         print file
         sys.stdout.flush()
 
-def prep_db_for_update( connection, path_iterator ):
+def prep_db_for_update( path_iterator ):
     """
     path_iterator here is a list of files that have been modified.
     Prior to initiating the transfer, mark all these files as untransferred in the database,
     creating records if they don't already exist.
     """
     logger.info("Prepping DB for date-based update.")
+    global dblock, options
+    dblock.acquire()
+    connection = sqlite3.Connection(options.inventory_db)
     cursor = connection.cursor()
     old = new = 0
     for path in path_iterator:
-        cursor.execute("SELECT count(id) FROM files WHERE path = ?", (path,) )
+        patient_execute(cursor, "SELECT count(id) FROM files WHERE path = ?", (path,) )
         if int(cursor.fetchone()[0]) > 0:
-            cursor.execute( 'UPDATE files SET transferred = 0 WHERE path = ?', (path,) )
+            patient_execute(cursor, 'UPDATE files SET transferred = 0 WHERE path = ?', (path,) )
             old += 1
         else:
-            cursor.execute('INSERT INTO files (path, transferred) VALUES (?,?);',  (path, 0) )
+            patient_execute(cursor,'INSERT INTO files (path, transferred) VALUES (?,?);',  (path, 0) )
             new += 1
     logger.info("Will update %d existing files and add %d new files." % (old, new) )
     connection.commit()
     cursor.close()
     logger.debug("Committed DB prep.")
+    connection.close()
+    dblock.release()
 
 def sync_file(path, bucket, start_path, check_remote=True):
     logger.info( "SYNC " + path + "...")
@@ -222,22 +260,21 @@ def set_path_status(filepaths, connection, status_value=1):
     if options.source_dir in filepaths[0]:
         filepaths = ( os.path.relpath(filepath, options.source_dir) for filepath in filepaths )
 
-    if dblock: 
-        logger.debug("acquiring database lock.")
-        dblock.acquire()
-        logger.debug("database lock acquired.")
-    cursor = connection.cursor()
-    for path in filepaths:
-        logger.debug("UPDATING: %s" % path)
-        cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
-        logger.debug("Query rowcount: "+str(cursor.rowcount))
-        assert cursor.rowcount == 1
-    logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(filepaths)) )
-    connection.commit()
-    time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
-    logger.debug("COMMITTED")
-    cursor.close()
-    if dblock: 
+    dblock.acquire()
+    try:
+        cursor = connection.cursor()
+        for path in filepaths:
+            logger.debug("UPDATING: %s" % path)
+            #cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
+            patient_execute(cursor, 'UPDATE files set transferred = ? where path = ?', (status_value, path))
+            logger.debug("Query rowcount: "+str(cursor.rowcount))
+            assert cursor.rowcount == 1
+        logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(filepaths)) )
+        connection.commit()
+        time.sleep(0.2) # the db seems to need some time to releae its lock after a commit
+        logger.debug("COMMITTED")
+    finally:
+        cursor.close()
         dblock.release()
 
 def worker(task_q, result_q, finished, dbname):
@@ -272,14 +309,16 @@ def db_reporter(q, finished, dbname):
         try:
             path = q.get(False, 0.1) # retry after a timeout
         except Queue.Empty:
+            time.sleep(0.2)
             continue
+        logging.debug("db_reporter marking got a result")
         set_path_status(path, connection, status_value=1)
         q.task_done()
 
 
 def sync_parallel(source_path_iterator, options):
     logger.info("Beginning parallel sync.")
-    global connection
+    connection = sqlite3.Connection(options.inventory_db)
     gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
 #    while response not in ('y','n'):
@@ -290,7 +329,6 @@ def sync_parallel(source_path_iterator, options):
     task_q = multiprocessing.JoinableQueue(options.max_queue_size)
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
     finished = multiprocessing.Event()
-    global dblock # using a global database lock, because sqlite locking is agressive and a bit sticky.
     logger.debug("Initializing subprocesses")
     subprocesses = [ multiprocessing.Process(target=worker, args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
     reporter = multiprocessing.Process(target=db_reporter, args=(result_q, finished, options.inventory_db) )
@@ -299,14 +337,18 @@ def sync_parallel(source_path_iterator, options):
     for p in subprocesses:
         p.start()
     job_number = 0
+    path_count = 0
     for paths in source_path_iterator:
         job_number += 1
-        logger.debug("Setting up job #%d" % job_number)
+        path_count += len(paths)
+        logger.debug("Setting up job #%d (%d paths)" % (job_number, len(paths)))
         set_path_status(paths, connection, status_value=-1)
         task_q.put( (job_number, paths, options.dest_bucket, options.source_dir) )
         logger.debug("Put job #%d into task_q" % job_number)
+        logger.debug("Total paths dispatched: %d" % path_count)
     else:
         logger.debug("source_path_iterator exhausted")
+        logger.debug("Total paths dispatched: %d" % path_count)
     logger.debug("Waiting for task_q to join.")
     task_q.join()
     logger.debug("Waiting for result_q to join.")
@@ -318,17 +360,18 @@ def sync_parallel(source_path_iterator, options):
         p.join()
     logger.info("All subprocesses joined.")
 
-def mark_for_deletion(record_id, relpath, dblock):
+def mark_for_deletion(connection, record_id, relpath):
+    global dblock
     logger.info("%s does not exist.  Marking for deletion." % relpath)
-    if dblock: dblock.acquire() 
-    global connection
+    dblock.acquire() 
     cursor = connection.cursor()
-    cursor.execute("UPDATE files SET local_deleted = 1 where id = %d" % record_id)
+    patient_execute(cursor,"UPDATE files SET local_deleted = 1 where id = %d" % record_id)
     cursor.close()
-    if dblock: dblock.release() 
+    dblock.release() 
 
-def names_from_db(dbname, which="untransfered", dblock=None, exclude_deleted=True):
-    global connection
+def names_from_db(dbname, which="untransfered", exclude_deleted=True):
+    global dblock, options
+    connection = sqlite3.Connection(options.inventory_db)
     last_max_id = -9999
     while True:
         qry = "SELECT id,path FROM files"
@@ -341,21 +384,23 @@ def names_from_db(dbname, which="untransfered", dblock=None, exclude_deleted=Tru
         qry += " LIMIT %d" % options.db_chunk_size
         logger.debug( qry )
 
-        if dblock: dblock.acquire()
+        dblock.acquire()
         cursor = connection.cursor()
-        cursor.execute(qry)
+        patient_execute(cursor,qry)
         records = cursor.fetchall()
         cursor.close()
-        if dblock: dblock.release()
+        dblock.release()
+        logger.debug("names_from_db pulled %d paths from the database." % len(records))
         if len(records) == 0: 
             break
         for record in records:
             if os.path.exists( os.path.join(options.source_dir, record[1]) ):
                 yield record[1]
             else:
-                mark_for_deletion( record[0], record[1], dblock )
+                mark_for_deletion( connection, record[0], record[1] )
         else:
             last_max_id = int(record[0])
+    connection.close()
 
 def get_chunks(path_generator):
     """
@@ -399,6 +444,7 @@ def local_inventory(source_dir, bucketname):
     Walk the local filesystem starting at source_dir and create a database cataloging the files in that
     directory tree.
     """
+    global dblock
     if os.path.exists(options.inventory_db):
         response = None   
         while response not in ('y','n'):
@@ -408,10 +454,11 @@ def local_inventory(source_dir, bucketname):
     inventory_path = options.inventory_path
     ensure_exists(inventory_path)
     conn = sqlite3.connect(options.inventory_db)
+    dblock.acquire()
     cursor = conn.cursor()
-    cursor.execute("DROP TABLE IF EXISTS files;")
-    cursor.execute("DROP INDEX IF EXISTS idx_path;")
-    cursor.execute("""
+    patient_execute(cursor,"DROP TABLE IF EXISTS files;")
+    patient_execute(cursor,"DROP INDEX IF EXISTS idx_path;")
+    patient_execute(cursor,"""
         CREATE TABLE files (
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
@@ -431,7 +478,7 @@ def local_inventory(source_dir, bucketname):
             relpath = os.path.relpath(filepath, source_dir)
             #filehash = md5_digest(filepath)
             #cursor.execute('INSERT INTO files (path, local_hash) VALUES (?, ?);',  (relpath, filehash))
-            cursor.execute('INSERT INTO files (path) VALUES (?);',  (relpath, ))
+            patient_execute(cursor,'INSERT INTO files (path) VALUES (?);',  (relpath, ))
             count += 1
             if count % DB_TRANSACTION_SIZE == 0:
                 conn.commit()
@@ -439,11 +486,12 @@ def local_inventory(source_dir, bucketname):
     else:
         conn.commit()
     print "Creating index...",
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_delete ON files(local_deleted);')
+    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
+    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
+    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
+    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_delete ON files(local_deleted);')
     print "Done."
+    dblock.release()
 
 def remote_inventory(source_dir, bucketname, options):
     """
@@ -466,21 +514,24 @@ def remote_inventory(source_dir, bucketname, options):
             assert p.wait() == 0
         print "done."
 
+    global dblock
+    dblock.acquire()
     conn = sqlite3.connect(options.inventory_db)
     cursor = conn.cursor()
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
+    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
 
     with open(listfile_name, 'r') as listfile:
         i = 0
         for line in listfile:
             path = line.strip()[len("gs://ge-mars/"):]
-            cursor.execute('UPDATE files SET remote_exists = 1 WHERE path == ?', (path,))
+            patient_execute(cursor,'UPDATE files SET remote_exists = 1 WHERE path == ?', (path,))
             i += 1
             if i % DB_TRANSACTION_SIZE == 0:    
                 conn.commit()
                 print "%d updates" % i
         else:
             conn.commit()
+    dblock.release()
     
 
 if __name__ == "__main__":
@@ -499,6 +550,7 @@ if __name__ == "__main__":
     parser.add_argument('-p', type=int, dest='num_processes', help='Number of subprocesses to spawn for sync-parallel', default=8)
     parser.add_argument('--max_queue_size', type=int, help="Size of the task queue", default=20)
     parser.add_argument('--db_chunk_size', type=int, help="Number of records to pull from the database per read", default=200)
+    parser.add_argument('--recycle', action='store_true', default=False, help="Draw the list of modified files from a logfile instead of scanning for them (speeds up debugging).")
     parser.add_argument('--debug', action='store_true', default=False, help="Turn on debug logging.")
 
     options = parser.parse_args()
@@ -527,12 +579,14 @@ if __name__ == "__main__":
 
     # Clear any pending-transfer status that may have been set if a previous run was aborted.
     print "Resetting enqueued transfers...",
+    dblock.acquire() # dblock is global
     cursor = connection.cursor()
-    cursor.execute("UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
+    patient_execute(cursor,"UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
     connection.commit()
     cursor.close()
     del cursor
     print "Done."
+    dblock.release()
 
     logging.debug("Start mode switching.")
 
@@ -550,11 +604,11 @@ if __name__ == "__main__":
         path_sources = []
         if options.use_db:
             logging.debug("use_db: Getting untransferred files from the db.")
-            path_sources.append( names_from_db(options.inventory_db, dblock=dblock) )
+            path_sources.append( names_from_db(options.inventory_db) )
         if options.use_modtime:
             logging.debug("use_modtime: Checking for modified files.")
             modified1, modified2 = itertools.tee(  list_modified_files(options.source_dir, options.sync_timestamp_file), 2)
-            prep_db_for_update( connection, modified1 ) # make sure all the db records exist
+            prep_db_for_update( modified1 ) # make sure all the db records exist
             #path_sources.append( get_chunks ( modified2 ) )
             path_sources.append(  modified2 ) 
 
