@@ -10,6 +10,7 @@ import subprocess
 import argparse
 import sqlite3
 import multiprocessing, logging, logging.handlers
+from ctypes import c_int
 import Queue
 import tempfile
 import itertools
@@ -21,11 +22,12 @@ logger.setLevel(logging.INFO)
 
 hdlr = logging.handlers.RotatingFileHandler('deploy.log', backupCount=1, maxBytes=0)
 hdlr.doRollover()
-formatter = logging.Formatter('%(asctime)s %(thread)d:%(lineno)d %(levelname)s %(message)s')
+formatter = logging.Formatter('%(asctime)s %(processName)s:%(lineno)d %(levelname)s %(message)s')
 hdlr.setFormatter(formatter)
 logger.addHandler(hdlr)
 
 DB_TRANSACTION_SIZE = 100000 # for bulk commits and updates to the inventory database
+SQLITE_TIMEOUT = 20.0 # seconds
 
 dblock = multiprocessing.Lock() # Using a global database lock because sqlite locks agressively and sometimes takes some time to unlock.
 
@@ -61,24 +63,44 @@ def patient(func):
                     raise
     return wrapped
 
+
+open_connections = multiprocessing.Value(c_int, 0, lock=True)
+open_cursors = multiprocessing.Value(c_int, 0, lock=True)
 class PatientCursor( sqlite3.Cursor ):
+    def __init__(self, *args, **kwargs):
+        open_cursors.value += 1
+        logger.debug("New cursor (%d)" % open_cursors.value)
+        return super(PatientCursor, self).__init__(*args, **kwargs)
+
+    def close(self, *args, **kwargs):
+        open_cursors.value -= 1
+        logger.debug("Close cursor (%d)" % open_cursors.value)
+        return super(PatientCursor, self).close(*args, **kwargs)
+
     @patient
     def execute(self, *args, **kwargs):
         logger.debug("PatientCursor.execute(): " + str(args))
         super(PatientCursor, self).execute(*args, **kwargs)
 
 class PatientConnection( sqlite3.Connection ):
+    def __init__(self, *args, **kwargs):
+        open_connections.value += 1
+        logger.debug("New connection (%d)" % open_connections.value)
+        return super(PatientConnection, self).__init__(*args, **kwargs)
+
+    def close(self, *args, **kwargs):
+        open_connections.value -= 1
+        logger.debug("Close connection (%d)" % open_connections.value)
+        return super(PatientConnection, self).close(*args, **kwargs)
+
+    def cursor(self, *args, **kwargs):
+        return super(PatientConnection, self).cursor(PatientCursor, *args, **kwargs)
+
     @patient
     def commit(self, *args, **kwargs):
         logger.debug("PatientConnection.commit().")
         super(PatientConnection, self).commit(*args, **kwargs)
-sqlite3.Cursor = PatientCursor # Monkey Patch THIS DOESNT WORK, SINCE THE CURSOR IS INSTANTIATED IN A C MODULE
 sqlite3.Connection = PatientConnection # Monkey Patch
-
-@patient
-def patient_execute(cursor, *args, **kwargs):
-    logger.debug("Patiently executing: %s" % args[0])
-    return cursor.execute(*args, **kwargs)       
 
 def gsutil(*args):
     args = (gsutil_path,) + args
@@ -155,16 +177,16 @@ def prep_db_for_update( path_iterator ):
     logger.info("Prepping DB for date-based update.")
     global dblock, options
     dblock.acquire()
-    connection = sqlite3.Connection(options.inventory_db)
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
     cursor = connection.cursor()
     old = new = 0
     for path in path_iterator:
-        patient_execute(cursor, "SELECT count(id) FROM files WHERE path = ?", (path,) )
+        cursor.execute("SELECT count(id) FROM files WHERE path = ?", (path,) )
         if int(cursor.fetchone()[0]) > 0:
-            patient_execute(cursor, 'UPDATE files SET transferred = 0 WHERE path = ?', (path,) )
+            cursor.execute( 'UPDATE files SET transferred = 0 WHERE path = ?', (path,) )
             old += 1
         else:
-            patient_execute(cursor,'INSERT INTO files (path, transferred) VALUES (?,?);',  (path, 0) )
+            cursor.execute('INSERT INTO files (path, transferred) VALUES (?,?);',  (path, 0) )
             new += 1
     logger.info("Will update %d existing files and add %d new files." % (old, new) )
     connection.commit()
@@ -266,7 +288,7 @@ def set_path_status(filepaths, connection, status_value=1):
         for path in filepaths:
             logger.debug("UPDATING: %s" % path)
             #cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
-            patient_execute(cursor, 'UPDATE files set transferred = ? where path = ?', (status_value, path))
+            cursor.execute('UPDATE files set transferred = ? where path = ?', (status_value, path))
             logger.debug("Query rowcount: "+str(cursor.rowcount))
             assert cursor.rowcount == 1
         logger.debug("UPDATED STATUS to %d: count %d" % (status_value, len(filepaths)) )
@@ -302,7 +324,7 @@ def worker(task_q, result_q, finished, dbname):
         logger.debug("job %d results delivered" % job_number)
     
 def db_reporter(q, finished, dbname):
-    connection = sqlite3.Connection(dbname)
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
     while True:
         if finished.is_set():
             break
@@ -318,7 +340,7 @@ def db_reporter(q, finished, dbname):
 
 def sync_parallel(source_path_iterator, options):
     logger.info("Beginning parallel sync.")
-    connection = sqlite3.Connection(options.inventory_db)
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
     gsutil( "setdefacl", "public-read", "gs://"+options.dest_bucket) # make uploads world-readable
     response = None
 #    while response not in ('y','n'):
@@ -330,8 +352,8 @@ def sync_parallel(source_path_iterator, options):
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
     finished = multiprocessing.Event()
     logger.debug("Initializing subprocesses")
-    subprocesses = [ multiprocessing.Process(target=worker, args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
-    reporter = multiprocessing.Process(target=db_reporter, args=(result_q, finished, options.inventory_db) )
+    subprocesses = [ multiprocessing.Process(target=worker, name="worker_"+str(i), args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
+    reporter = multiprocessing.Process(target=db_reporter, name="reporter", args=(result_q, finished, options.inventory_db) )
     subprocesses.append(reporter)
     logger.debug("Starting subprocesses")
     for p in subprocesses:
@@ -365,13 +387,15 @@ def mark_for_deletion(connection, record_id, relpath):
     logger.info("%s does not exist.  Marking for deletion." % relpath)
     dblock.acquire() 
     cursor = connection.cursor()
-    patient_execute(cursor,"UPDATE files SET local_deleted = 1 where id = %d" % record_id)
+    cursor.execute("UPDATE files SET local_deleted = 1 where id = %d" % record_id)
+    connection.commit()
+    time.sleep(0.1)
     cursor.close()
     dblock.release() 
 
 def names_from_db(dbname, which="untransfered", exclude_deleted=True):
     global dblock, options
-    connection = sqlite3.Connection(options.inventory_db)
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
     last_max_id = -9999
     while True:
         qry = "SELECT id,path FROM files"
@@ -386,8 +410,10 @@ def names_from_db(dbname, which="untransfered", exclude_deleted=True):
 
         dblock.acquire()
         cursor = connection.cursor()
-        patient_execute(cursor,qry)
+        cursor.execute(qry)
         records = cursor.fetchall()
+        connection.commit()
+        time.sleep(0.1)
         cursor.close()
         dblock.release()
         logger.debug("names_from_db pulled %d paths from the database." % len(records))
@@ -456,9 +482,9 @@ def local_inventory(source_dir, bucketname):
     conn = sqlite3.connect(options.inventory_db)
     dblock.acquire()
     cursor = conn.cursor()
-    patient_execute(cursor,"DROP TABLE IF EXISTS files;")
-    patient_execute(cursor,"DROP INDEX IF EXISTS idx_path;")
-    patient_execute(cursor,"""
+    cursor.execute("DROP TABLE IF EXISTS files;")
+    cursor.execute("DROP INDEX IF EXISTS idx_path;")
+    cursor.execute("""
         CREATE TABLE files (
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
@@ -478,7 +504,7 @@ def local_inventory(source_dir, bucketname):
             relpath = os.path.relpath(filepath, source_dir)
             #filehash = md5_digest(filepath)
             #cursor.execute('INSERT INTO files (path, local_hash) VALUES (?, ?);',  (relpath, filehash))
-            patient_execute(cursor,'INSERT INTO files (path) VALUES (?);',  (relpath, ))
+            cursor.execute('INSERT INTO files (path) VALUES (?);',  (relpath, ))
             count += 1
             if count % DB_TRANSACTION_SIZE == 0:
                 conn.commit()
@@ -486,10 +512,10 @@ def local_inventory(source_dir, bucketname):
     else:
         conn.commit()
     print "Creating index...",
-    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
-    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
-    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
-    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_delete ON files(local_deleted);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_remote_exists ON files(remote_exists);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_transferred ON files(transferred);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_delete ON files(local_deleted);')
     print "Done."
     dblock.release()
 
@@ -518,13 +544,13 @@ def remote_inventory(source_dir, bucketname, options):
     dblock.acquire()
     conn = sqlite3.connect(options.inventory_db)
     cursor = conn.cursor()
-    patient_execute(cursor,'CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
 
     with open(listfile_name, 'r') as listfile:
         i = 0
         for line in listfile:
             path = line.strip()[len("gs://ge-mars/"):]
-            patient_execute(cursor,'UPDATE files SET remote_exists = 1 WHERE path == ?', (path,))
+            cursor.execute('UPDATE files SET remote_exists = 1 WHERE path == ?', (path,))
             i += 1
             if i % DB_TRANSACTION_SIZE == 0:    
                 conn.commit()
@@ -566,7 +592,7 @@ if __name__ == "__main__":
         multiprocessing.log_to_stderr().setLevel(multiprocessing.SUBDEBUG)
 
 
-    connection = sqlite3.Connection(options.inventory_db)
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
 
     # look for gsutil in some reasonable places if it's not provided at the command line
     global gsutil_path
@@ -581,7 +607,7 @@ if __name__ == "__main__":
     print "Resetting enqueued transfers...",
     dblock.acquire() # dblock is global
     cursor = connection.cursor()
-    patient_execute(cursor,"UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
+    cursor.execute("UPDATE files SET remote_exists = NULL WHERE remote_exists == -1")
     connection.commit()
     cursor.close()
     del cursor
