@@ -150,11 +150,11 @@ def list_modified_files(root_path, reference_file):
         for line in p.stdout.readlines():
             path = line.strip()
             if not os.path.isdir(path):
-                i += 1
-                relpath = os.path.relpath(path, root_path)
-                logger.info("Found modified file: %s" % relpath)
-                logfile.write(relpath + "\n")
-                yield relpath
+                    i += 1
+                    relpath = os.path.relpath(path, root_path)
+                    logger.info("Found modified file: %s" % relpath)
+                    logfile.write(relpath + "\n")
+                    yield relpath
         else:
             logger.info("FIND iterator is exhausted (%d paths yielded)." % i)
 
@@ -350,14 +350,20 @@ def sync_parallel(source_path_iterator, options):
 
     task_q = multiprocessing.JoinableQueue(options.max_queue_size)
     result_q = multiprocessing.JoinableQueue(options.max_queue_size)
+    global delete_queue
+    delete_queue = multiprocessing.JoinableQueue()
     finished = multiprocessing.Event()
     logger.debug("Initializing subprocesses")
     subprocesses = [ multiprocessing.Process(target=worker, name="worker_"+str(i), args=(task_q, result_q, finished, options.inventory_db)) for i in range(options.num_processes) ]
     reporter = multiprocessing.Process(target=db_reporter, name="reporter", args=(result_q, finished, options.inventory_db) )
     subprocesses.append(reporter)
+    subprocesses.append( multiprocessing.Process( target=delete_marker_worker, name="deleteMarker", args=(delete_queue, finished) ) )
     logger.debug("Starting subprocesses")
     for p in subprocesses:
         p.start()
+    global delete_worker_started # used by mark_for_deletion()
+    delete_worker_started = True
+
     job_number = 0
     path_count = 0
     for paths in source_path_iterator:
@@ -375,6 +381,8 @@ def sync_parallel(source_path_iterator, options):
     task_q.join()
     logger.debug("Waiting for result_q to join.")
     result_q.join()
+    logger.debug("Waiting for delete_queue to join.")
+    delete_queue.join()
     logger.debug("Setting the finished event")
     finished.set()
     logger.info("Finished.  Waiting for subprocesses to join")
@@ -382,9 +390,9 @@ def sync_parallel(source_path_iterator, options):
         p.join()
     logger.info("All subprocesses joined.")
 
-def mark_for_deletion(connection, record_id, relpath):
+def _mark_for_deletion(connection, record_id, relpath):
     global dblock
-    logger.info("%s does not exist.  Marking for deletion." % relpath)
+    logger.info("Marking for deletion: %s" % relpath)
     dblock.acquire() 
     cursor = connection.cursor()
     cursor.execute("UPDATE files SET local_deleted = 1 where id = %d" % record_id)
@@ -392,6 +400,26 @@ def mark_for_deletion(connection, record_id, relpath):
     time.sleep(0.1)
     cursor.close()
     dblock.release() 
+
+delete_worker_started = False
+def mark_for_deletion(connection, record_id, relpath):
+    global delete_worker_started, delete_queue
+    if delete_worker_started:
+        delete_queue.put((record_id, relpath)) # connection doesn't get used in this mode.
+    else:
+        _mark_for_deletion(connection, record_id, relpath)
+
+def delete_marker_worker(delete_queue, finished):
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
+    while not finished.is_set():
+        try:
+            record_id, relpath = delete_queue.get(False, 0.5)
+            _mark_for_deletion(connection, record_id, relpath)
+            delete_queue.task_done()
+        except Queue.Empty:
+            time.sleep(0.5)
+            continue
+    connection.close()
 
 def names_from_db(dbname, which="untransfered", exclude_deleted=True):
     global dblock, options
