@@ -428,7 +428,10 @@ def names_from_db(dbname, which="untransfered", exclude_deleted=True):
     while True:
         qry = "SELECT id,path FROM files"
         qry += " WHERE id > %d " % last_max_id
-        if which != "all":
+        if which == 'local_deleted':
+            exclude_deleted = False
+            qry += " AND local_deleted = 1"
+        if which == "untransfered":
             qry += " AND ( transferred IS NULL OR transferred != 1)"
         if exclude_deleted:
             qry += " AND local_deleted != 1"
@@ -448,7 +451,8 @@ def names_from_db(dbname, which="untransfered", exclude_deleted=True):
         if len(records) == 0: 
             break
         for record in records:
-            if os.path.exists( os.path.join(options.source_dir, record[1]) ):
+            # Only return records that still exist on the local filesystem, unless we're in cleanup mode
+            if (which == 'local_deleted') or os.path.exists( os.path.join(options.source_dir, record[1]) ):
                 yield record[1]
             else:
                 mark_for_deletion( connection, record[0], record[1] )
@@ -587,10 +591,50 @@ def remote_inventory(source_dir, bucketname, options):
             conn.commit()
     dblock.release()
     
+###
+# Clean up by deleting old files from GCS.
+# Especially important for the live THEMIS images that generate sparse quad trees that are different every day.
+
+def _db_delete_worker(delete_q, finished):
+    global dblock, options
+    logger.info("Delete worker is running")
+    connection = sqlite3.connect(options.inventory_db, timeout=SQLITE_TIMEOUT, factory=PatientConnection)
+    cursor = connection.cursor()
+    while not finished.is_set():
+        try:
+            path = delete_q.get()
+        except Queue.Empty:
+            time.sleep(0.5)
+            continue
+        dblock.acquire()
+        cursor.execute("DELETE FROM files WHERE path = '%s'" % path)
+        if cursor.rowcount != 1:
+            logger.warning( "Rowcount was %d after deleting %s" % (cursor.rowcount, path) )
+        connection.commit()
+        dblock.release()
+        delete_q.task_done()
+    logger.info("Delete worker is terminating")
+
+def cleanup():
+    global options
+    paths = names_from_db(options.inventory_db, 'local_deleted')
+    delete_q = multiprocessing.JoinableQueue()
+    finished = multiprocessing.Event()
+    delete_worker = multiprocessing.Process( target=_db_delete_worker, name="deleteWorker", args=(delete_q, finished) )
+    delete_worker.start()
+    for relpath in paths:
+        gsutil('rm', 'gs://%s/%s' % (options.dest_bucket, relpath) )
+        delete_q.put(relpath)
+    delete_q.join()
+    finished.set()
+    delete_worker.join()
+
+# end clean up
+###
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-serial', 'sync-parallel', 'show-modified'])
+    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-serial', 'sync-parallel', 'show-modified', 'cleanup'])
 
     parser.add_argument('--dir', dest='source_dir', metavar='rood source directory', default=settings.OUTPUT_PATH_BASE)
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
@@ -677,6 +721,10 @@ if __name__ == "__main__":
 
         if options.use_modtime: # only touch the timestamp file if we used modtime for the sync
             touch( options.sync_timestamp_file ) # update last sync timestamp
+
+    elif options.command == 'cleanup':
+        # Delete remote objects that have been deleted locally.
+        cleanup()
 
     else:
         assert False # argparse shouldn't let us get to this condition
