@@ -105,7 +105,16 @@ sqlite3.Connection = PatientConnection # Monkey Patch
 def gsutil(*args):
     args = (gsutil_path,) + args
     print " ".join(args)
-    return subprocess.check_call(args)
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = "\n".join( p.communicate() )
+    if p.returncode == 0:
+        return
+    else:
+        # emulate the behavior of Python 2.7's subprocess.check_output()
+        e = subprocess.CalledProcessError(p.returncode, " ".join(args))
+        e.output = output
+        raise e
+    #return subprocess.check_output(args)
 
 def md5_digest(filepath):
     md5 = hashlib.md5()
@@ -623,7 +632,11 @@ def cleanup():
     delete_worker = multiprocessing.Process( target=_db_delete_worker, name="deleteWorker", args=(delete_q, finished) )
     delete_worker.start()
     for relpath in paths:
-        gsutil('rm', 'gs://%s/%s' % (options.dest_bucket, relpath) )
+        try:
+            gsutil('rm', 'gs://%s/%s' % (options.dest_bucket, relpath) )
+        except subprocess.CalledProcessError, e:
+            if not ("code=NoSuchKey" in e.output or "reason=Not Found" in e.output): # 404.  It's already beed deleted.
+                raise e
         delete_q.put(relpath)
     delete_q.join()
     finished.set()
