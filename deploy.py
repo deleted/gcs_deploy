@@ -440,7 +440,7 @@ def names_from_db(dbname, which="untransfered", exclude_deleted=True):
         if which == 'local_deleted':
             exclude_deleted = False
             qry += " AND local_deleted = 1"
-        if which == "untransfered":
+        elif which == "untransfered":
             qry += " AND ( transferred IS NULL OR transferred != 1)"
         if exclude_deleted:
             qry += " AND local_deleted != 1"
@@ -585,7 +585,9 @@ def remote_inventory(source_dir, bucketname, options):
     dblock.acquire()
     conn = sqlite3.connect(options.inventory_db)
     cursor = conn.cursor()
+    cursor.execute('UPDATE files SET remote_exists = NULL;')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_path ON files(path);')
+    conn.commit()
 
     with open(listfile_name, 'r') as listfile:
         i = 0
@@ -626,18 +628,20 @@ def _db_delete_worker(delete_q, finished):
 
 def cleanup():
     global options
-    paths = names_from_db(options.inventory_db, 'local_deleted')
+    paths = names_from_db(options.inventory_db, which='local_deleted')
     delete_q = multiprocessing.JoinableQueue()
     finished = multiprocessing.Event()
     delete_worker = multiprocessing.Process( target=_db_delete_worker, name="deleteWorker", args=(delete_q, finished) )
     delete_worker.start()
     for relpath in paths:
+        logger.info("removing from GCS: "+relpath)
         try:
             gsutil('rm', 'gs://%s/%s' % (options.dest_bucket, relpath) )
         except subprocess.CalledProcessError, e:
             if not ("code=NoSuchKey" in e.output or "reason=Not Found" in e.output): # 404.  It's already beed deleted.
                 raise e
         delete_q.put(relpath)
+    print "Finished cleanup.  Shutting down."
     delete_q.join()
     finished.set()
     delete_worker.join()
