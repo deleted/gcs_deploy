@@ -259,15 +259,6 @@ def transfer_chunk(paths, bucket, root_path):
     logger.info("Deleting tmpdir: "+tmpdir)
     subprocess.check_call( ('rm', '-rf', tmpdir) )
 
-def sync_recursive(source_dir, dest_bucket):
-    """ Sync files from source path to dest_bucket on GCS."""
-    gsutil( "setdefacl", "public-read", "gs://"+dest_bucket) # make uploads world-readable
-    print "%s --> gs://%s" % (source_dir, dest_bucket)
-    for (dirpath, dirnames, filenames) in os.walk(source_dir):
-        print len(filenames)
-        for filename in filenames:
-            sync_file(os.path.join(dirpath, filename), dest_bucket, source_dir)
-
 def increment_string(s):
     return s[:-1] + chr(ord(s[-1])+1)
 
@@ -651,7 +642,7 @@ def cleanup():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-serial', 'sync-parallel', 'show-modified', 'cleanup'])
+    parser.add_argument('command', choices=['local-inventory', 'remote-inventory', 'sync', 'sync-parallel', 'show-modified', 'cleanup'])
 
     parser.add_argument('--dir', dest='source_dir', metavar='rood source directory', default=settings.OUTPUT_PATH_BASE)
     parser.add_argument('--bucket', dest='dest_bucket', default=settings.TARGET_GCS_BUCKET)
@@ -711,10 +702,6 @@ if __name__ == "__main__":
         show_modified(options)
     elif options.command == 'remote-inventory':
         remote_inventory(options.source_dir, options.dest_bucket, options)
-    elif options.command == 'sync-serial':
-        #sync_recursive(options.source_dir, options.dest_bucket)
-        #touch( options.sync_timestamp_file, time=start_time) # update last sync timestamp
-        raise NotImplementedError("You probably want sync-parallel")
     elif options.command == 'sync-parallel' or options.command == 'sync':
         path_sources = []
         if options.use_db:
