@@ -705,6 +705,8 @@ if __name__ == "__main__":
     elif options.command == 'sync-parallel' or options.command == 'sync':
         path_sources = []
         if options.use_db:
+            if not os.path.exists(options.inventory_db):
+                raise Exception("No database exists at %s.  Run local-inventory." % options.inventory_db)
             logging.debug("use_db: Getting untransferred files from the db.")
             path_sources.append( names_from_db(options.inventory_db) )
         if options.use_modtime:
